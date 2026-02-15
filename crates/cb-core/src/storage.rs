@@ -224,14 +224,29 @@ impl Storage {
     ) -> Result<(), rusqlite::Error> {
         // Validate inputs to prevent SQL injection in ATTACH DATABASE
         // (parameterized queries are not supported for ATTACH)
-        if encrypted_path.contains('\'') || encrypted_path.contains('\0') {
+
+        // Whitelist validation for file path: allow only alphanumeric, path separators,
+        // hyphens, underscores, dots, and spaces (common filesystem-safe characters)
+        if encrypted_path.is_empty()
+            || !encrypted_path.chars().all(|c| {
+                c.is_alphanumeric()
+                    || matches!(c, '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | '~')
+            })
+        {
             return Err(rusqlite::Error::InvalidParameterName(
-                "encrypted_path contains invalid characters".to_string(),
+                "encrypted_path contains invalid characters (only alphanumeric, /, \\, -, _, ., :, ~, space allowed)".to_string(),
             ));
         }
-        if encryption_key.contains('\'') || encryption_key.contains('\0') {
+
+        // Encryption key validation: allow only hex characters and common key formats
+        // (alphanumeric, hyphens for UUID-style keys, +/= for base64)
+        if encryption_key.is_empty()
+            || !encryption_key
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '+' | '/' | '='))
+        {
             return Err(rusqlite::Error::InvalidParameterName(
-                "encryption_key contains invalid characters".to_string(),
+                "encryption_key contains invalid characters (only alphanumeric, -, +, /, = allowed)".to_string(),
             ));
         }
 
@@ -264,9 +279,18 @@ impl Storage {
             return self.get_recent_entries(limit);
         }
 
-        // Sanitize FTS5 special characters: remove * (prefix operator) and escape double quotes
-        let sanitized = trimmed.replace('*', "");
+        // Comprehensive FTS5 sanitization:
+        // 1. Remove FTS5 special characters that have meaning even inside phrases
+        let sanitized: String = trimmed
+            .chars()
+            .filter(|c| !matches!(c, '*' | '^' | '+'))
+            .collect();
+        // 2. Escape double quotes (FTS5 phrase delimiter)
         let escaped = sanitized.replace('"', "\"\"");
+        // 3. Remove FTS5 boolean operators (NEAR, AND, OR, NOT) as whole words
+        //    These can affect query parsing even within some FTS5 contexts
+        let escaped = Self::remove_fts5_operators(&escaped);
+        let escaped = escaped.trim();
         let fts_query = if escaped.is_empty() {
             return self.get_recent_entries(limit);
         } else {
@@ -315,6 +339,21 @@ impl Storage {
             params![now, id],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Remove FTS5 boolean operators (AND, OR, NOT, NEAR) as whole words.
+    /// These operators can affect FTS5 query parsing and must be stripped from user input.
+    fn remove_fts5_operators(input: &str) -> String {
+        let operators = ["AND", "OR", "NOT", "NEAR"];
+        let words: Vec<&str> = input.split_whitespace().collect();
+        let filtered: Vec<&str> = words
+            .into_iter()
+            .filter(|word| {
+                let upper = word.to_uppercase();
+                !operators.contains(&upper.as_str())
+            })
+            .collect();
+        filtered.join(" ")
     }
 
     pub fn cleanup_old_entries(&self, max_age_days: i32) -> Result<u64, rusqlite::Error> {
@@ -759,6 +798,160 @@ mod tests {
         // Query with timestamp+1 should include all entries
         let entries = storage.get_entries_before(ts + 1, 10).unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    // === Issue #2: FTS5 sanitization tests ===
+
+    #[test]
+    fn test_search_sanitizes_fts5_operators() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "hello world", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "goodbye world", "App").unwrap();
+
+        // "hello OR goodbye" should not act as a boolean query matching both entries
+        // After sanitization, only the remaining words are searched as a phrase
+        let results = storage.search_entries("hello OR goodbye", 10).unwrap();
+        // "OR" is removed, search becomes "hello goodbye" as a phrase, which won't match either
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_sanitizes_near_operator() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "foo bar baz", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "foo something bar", "App").unwrap();
+
+        // "foo NEAR bar" with NEAR operator would match both (proximity search).
+        // After sanitization, NEAR is removed: "foo bar" becomes phrase prefix "foo bar"*
+        // which only matches the entry that has "foo bar" as a contiguous phrase.
+        let results = storage.search_entries("foo NEAR bar", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text_content.as_deref(), Some("foo bar baz"));
+    }
+
+    #[test]
+    fn test_search_sanitizes_not_operator() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "hello world", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "goodbye world", "App").unwrap();
+
+        // "NOT goodbye" should not act as negation
+        let results = storage.search_entries("NOT goodbye", 10).unwrap();
+        // After removing NOT, searches for "goodbye" as phrase prefix
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text_content.as_deref(), Some("goodbye world"));
+    }
+
+    #[test]
+    fn test_search_sanitizes_special_chars() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "test data", "App").unwrap();
+
+        // Special chars *, ^, + should be stripped
+        let results = storage.search_entries("test*^+", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_only_operators_returns_all() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "entry1", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "entry2", "App").unwrap();
+
+        // Query containing only operators should fall back to get_recent_entries
+        let results = storage.search_entries("AND OR NOT", 10).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_fts5_operators() {
+        assert_eq!(Storage::remove_fts5_operators("hello AND world"), "hello world");
+        assert_eq!(Storage::remove_fts5_operators("hello OR world"), "hello world");
+        assert_eq!(Storage::remove_fts5_operators("NOT hello"), "hello");
+        assert_eq!(Storage::remove_fts5_operators("a NEAR b"), "a b");
+        // Case insensitive
+        assert_eq!(Storage::remove_fts5_operators("hello and world"), "hello world");
+        assert_eq!(Storage::remove_fts5_operators("hello or world"), "hello world");
+        // Should not remove partial matches
+        assert_eq!(Storage::remove_fts5_operators("android notable"), "android notable");
+    }
+
+    // === Issue #3: migrate_to_encrypted validation tests ===
+
+    #[test]
+    fn test_migrate_rejects_single_quote_in_path() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain.db",
+            "/tmp/it's.db",
+            "valid-key",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_semicolon_in_path() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain.db",
+            "/tmp/test;DROP TABLE--",
+            "valid-key",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_special_chars_in_key() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain.db",
+            "/tmp/encrypted.db",
+            "key'; DROP TABLE--",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_path() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain.db",
+            "",
+            "valid-key",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_key() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain.db",
+            "/tmp/encrypted.db",
+            "",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_accepts_valid_path_and_key() {
+        // Valid path with common filesystem characters
+        let dir = std::env::temp_dir().join("cb_test_validate");
+        let _ = std::fs::create_dir_all(&dir);
+        let plain_path = dir.join("plain.db");
+        let encrypted_path = dir.join("encrypted.db");
+        let _ = std::fs::remove_file(&plain_path);
+        let _ = std::fs::remove_file(&encrypted_path);
+
+        {
+            let storage = Storage::new(plain_path.to_str().unwrap(), None).unwrap();
+            storage.insert_text_entry(&ContentType::PlainText, "test", "App").unwrap();
+        }
+
+        // alphanumeric + hyphens + base64 chars are valid
+        let result = Storage::migrate_to_encrypted(
+            plain_path.to_str().unwrap(),
+            encrypted_path.to_str().unwrap(),
+            "valid-key-base64+ABC/def=",
+        );
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
