@@ -21,7 +21,9 @@ class ShortcutManager {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.reregister()
+            Task { @MainActor in
+                self?.reregister()
+            }
         }
     }
 
