@@ -13,6 +13,17 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+
+      - name: Check macOS SDK version
+        id: sdk-check
+        run: |
+          SDK_VERSION=$(xcrun --show-sdk-version)
+          MAJOR=$(echo "$SDK_VERSION" | cut -d. -f1)
+          if [ "$MAJOR" -lt 26 ]; then
+            echo "::error::macOS SDK $SDK_VERSION does not support Liquid Glass APIs (requires 26.0+). Release build aborted."
+            exit 1
+          fi
+
       - run: brew install xcodegen
 
       - name: Build Rust (arm64)
@@ -36,27 +47,12 @@ jobs:
         run: |
           xcodebuild -project CB.xcodeproj -scheme CB -configuration Release \
             build \
-            CB_CODE_SIGNING_ALLOWED="${{ secrets.APPLE_DEVELOPER_ID != '' && 'YES' || 'NO' }}" \
-            CB_CODE_SIGN_IDENTITY="${{ secrets.APPLE_DEVELOPER_ID || '-' }}" \
-            CB_ENABLE_HARDENED_RUNTIME="${{ secrets.APPLE_DEVELOPER_ID != '' && 'YES' || 'NO' }}"
+            CB_CODE_SIGNING_ALLOWED=NO
 
       - name: Package
         run: |
           BUILD_DIR=$(xcodebuild -project CB.xcodeproj -scheme CB -configuration Release -showBuildSettings | grep -m 1 "BUILT_PRODUCTS_DIR" | awk '{print $3}')
           ditto -c -k --keepParent "$BUILD_DIR/CB.app" CB-${GITHUB_REF_NAME}-universal.zip
-
-      - name: Notarize
-        if: secrets.APPLE_NOTARY_TEAM_ID != ''
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
-        run: |
-          xcrun notarytool submit CB-${GITHUB_REF_NAME}-universal.zip \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait
 
       - uses: softprops/action-gh-release@v2
         with:

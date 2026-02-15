@@ -10,8 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - name: Cross-compile for x86_64
+        run: cargo build --release -p cb-core --target x86_64-apple-darwin
   xcode-build:
     runs-on: macos-latest
     needs: rust-test
