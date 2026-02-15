@@ -1,5 +1,8 @@
 import AppKit
 import Combine
+import os
+
+private let logger = Logger(subsystem: "com.otkrickey.cb", category: "ClipboardMonitor")
 
 @MainActor
 class ClipboardMonitor: ObservableObject {
@@ -71,7 +74,12 @@ class ClipboardMonitor: ObservableObject {
             let contentType = isFilePath ? "FilePath" : "PlainText"
 
             Task.detached {
-                let _ = save_clipboard_entry(contentType, string, sourceApp)
+                let success = save_clipboard_entry(contentType, string, sourceApp)
+                if !success {
+                    await MainActor.run {
+                        logger.error("Failed to save clipboard entry (type: \(contentType))")
+                    }
+                }
             }
             latestEntryTimestamp = Date()
         } else if let imageData = pasteboard.data(forType: .tiff) ?? pasteboard.data(forType: .png) {
@@ -82,10 +90,15 @@ class ClipboardMonitor: ObservableObject {
             Task.detached {
                 imageData.withUnsafeBytes { rawBuffer in
                     let buffer = rawBuffer.bindMemory(to: UInt8.self)
-                    let _ = save_clipboard_image(
+                    let success = save_clipboard_image(
                         UnsafeBufferPointer(start: buffer.baseAddress, count: buffer.count),
                         sourceApp
                     )
+                    if !success {
+                        Task { @MainActor in
+                            logger.error("Failed to save clipboard image")
+                        }
+                    }
                 }
             }
             latestEntryTimestamp = Date()

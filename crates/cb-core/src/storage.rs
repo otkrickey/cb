@@ -264,9 +264,14 @@ impl Storage {
             return self.get_recent_entries(limit);
         }
 
-        // Escape double quotes for FTS5 phrase query (wrapping in quotes handles other special chars)
-        let escaped = trimmed.replace('"', "\"\"");
-        let fts_query = format!("\"{}\"*", escaped);
+        // Sanitize FTS5 special characters: remove * (prefix operator) and escape double quotes
+        let sanitized = trimmed.replace('*', "");
+        let escaped = sanitized.replace('"', "\"\"");
+        let fts_query = if escaped.is_empty() {
+            return self.get_recent_entries(limit);
+        } else {
+            format!("\"{}\"*", escaped)
+        };
 
         let mut stmt = self.conn.prepare(
             "SELECT e.id, e.content_type, e.text_content, e.source_app, e.created_at, e.copy_count, e.first_copied_at

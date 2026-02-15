@@ -150,7 +150,7 @@ class HistoryViewModel {
         guard !loadingImageIds.contains(id) else { return nil }
         loadingImageIds.insert(id)
 
-        Task.detached { @MainActor [weak self] in
+        Task { @MainActor [weak self] in
             guard let self else { return }
             guard let rustVec = get_entry_image(id) else {
                 self.loadingImageIds.remove(id)
