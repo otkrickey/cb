@@ -1,0 +1,94 @@
+import AppKit
+import Combine
+
+@MainActor
+class ClipboardMonitor: ObservableObject {
+    @Published var latestEntryTimestamp: Date = Date()
+
+    var skipNextChange = false
+
+    private var timer: Timer?
+    private var lastChangeCount: Int = 0
+    private var lastContentHash: Int = 0
+    private var isChecking = false
+
+    init() {
+        startMonitoring()
+    }
+
+    deinit {
+        // Safe to access from deinit as the object is being destroyed
+        MainActor.assumeIsolated {
+            timer?.invalidate()
+        }
+    }
+
+    func startMonitoring() {
+        lastChangeCount = NSPasteboard.general.changeCount
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.isChecking else { return }
+                self.isChecking = true
+                defer { self.isChecking = false }
+                self.checkClipboard()
+            }
+        }
+    }
+
+    func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func checkClipboard() {
+        let pasteboard = NSPasteboard.general
+        let currentCount = pasteboard.changeCount
+
+        guard currentCount != lastChangeCount else { return }
+        lastChangeCount = currentCount
+
+        if skipNextChange {
+            skipNextChange = false
+            return
+        }
+
+        let sourceApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+
+        if let string = pasteboard.string(forType: .string) {
+            let hash = string.hashValue
+            guard hash != lastContentHash else { return }
+            lastContentHash = hash
+
+            let isFilePath: Bool = {
+                let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed.hasPrefix("/") || trimmed.hasPrefix("~") else { return false }
+                // 複数行テキストはパスではない
+                guard !trimmed.contains("\n") else { return false }
+                // パスらしいパターン: スラッシュ区切りのパスコンポーネント
+                let pathPattern = #"^[~/][\w\-./\s]+"#
+                return trimmed.range(of: pathPattern, options: .regularExpression) != nil
+            }()
+            let contentType = isFilePath ? "FilePath" : "PlainText"
+
+            Task.detached {
+                let _ = save_clipboard_entry(contentType, string, sourceApp)
+            }
+            latestEntryTimestamp = Date()
+        } else if let imageData = pasteboard.data(forType: .tiff) ?? pasteboard.data(forType: .png) {
+            let hash = imageData.hashValue
+            guard hash != lastContentHash else { return }
+            lastContentHash = hash
+
+            Task.detached {
+                imageData.withUnsafeBytes { rawBuffer in
+                    let buffer = rawBuffer.bindMemory(to: UInt8.self)
+                    let _ = save_clipboard_image(
+                        UnsafeBufferPointer(start: buffer.baseAddress, count: buffer.count),
+                        sourceApp
+                    )
+                }
+            }
+            latestEntryTimestamp = Date()
+        }
+    }
+}
