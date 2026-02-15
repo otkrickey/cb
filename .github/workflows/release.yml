@@ -1,0 +1,72 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xcodegen
+
+      - name: Build Rust (arm64)
+        run: cargo build --release -p cb-core --target aarch64-apple-darwin
+
+      - name: Build Rust (x86_64)
+        run: cargo build --release -p cb-core --target x86_64-apple-darwin
+
+      - name: Create Universal Binary
+        run: |
+          mkdir -p target/universal-release
+          lipo -create \
+            target/aarch64-apple-darwin/release/libcb_core.a \
+            target/x86_64-apple-darwin/release/libcb_core.a \
+            -output target/release/libcb_core.a
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build App
+        run: |
+          xcodebuild -project CB.xcodeproj -scheme CB -configuration Release \
+            build \
+            CB_CODE_SIGNING_ALLOWED="${{ secrets.APPLE_DEVELOPER_ID != '' && 'YES' || 'NO' }}" \
+            CB_CODE_SIGN_IDENTITY="${{ secrets.APPLE_DEVELOPER_ID || '-' }}" \
+            CB_ENABLE_HARDENED_RUNTIME="${{ secrets.APPLE_DEVELOPER_ID != '' && 'YES' || 'NO' }}"
+
+      - name: Package
+        run: |
+          BUILD_DIR=$(xcodebuild -project CB.xcodeproj -scheme CB -configuration Release -showBuildSettings | grep -m 1 "BUILT_PRODUCTS_DIR" | awk '{print $3}')
+          ditto -c -k --keepParent "$BUILD_DIR/CB.app" CB-${GITHUB_REF_NAME}-universal.zip
+
+      - name: Notarize
+        if: secrets.APPLE_NOTARY_TEAM_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          xcrun notarytool submit CB-${GITHUB_REF_NAME}-universal.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: CB-*.zip
+          generate_release_notes: true
+          body: |
+            ## Architecture
+            - Universal Binary (Apple Silicon + Intel)
+
+            ## Installation
+            1. Download `CB-${{ github.ref_name }}-universal.zip`
+            2. Extract and move `CB.app` to `/Applications`
+            3. Launch CB from Applications

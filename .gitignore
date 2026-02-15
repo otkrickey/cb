@@ -1,0 +1,41 @@
+# デフォルトで全て除外
+*
+
+# ルートファイル
+!.gitignore
+!CLAUDE.md
+!README.md
+!LICENSE
+!Cargo.toml
+!Cargo.lock
+!project.yml
+
+# .claude/
+!.claude/
+!.claude/**
+
+# .github/
+!.github/
+!.github/**
+
+# CB/
+!CB/
+!CB/**
+
+# crates/
+!crates/
+!crates/**
+
+# docs/
+!docs/
+!docs/**
+
+# claudedocs/
+!claudedocs/
+!claudedocs/**
+
+# ホワイトリスト内でも常に除外
+.DS_Store
+**/*.xcodeproj/**
+*.xcuserstate
+**/xcuserdata/**
