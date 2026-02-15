@@ -10,35 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-
-      - name: Check macOS SDK version
-        id: sdk-check
-        run: |
-          SDK_VERSION=$(xcrun --show-sdk-version)
-          MAJOR=$(echo "$SDK_VERSION" | cut -d. -f1)
-          if [ "$MAJOR" -lt 26 ]; then
-            echo "::error::macOS SDK $SDK_VERSION does not support Liquid Glass APIs (requires 26.0+). Release build aborted."
-            exit 1
-          fi
-
       - run: brew install xcodegen
 
       - name: Build Rust (arm64)
-        run: cargo build --release -p cb-core --target aarch64-apple-darwin
-
-      - name: Build Rust (x86_64)
-        run: cargo build --release -p cb-core --target x86_64-apple-darwin
-
-      - name: Create Universal Binary
-        run: |
-          mkdir -p target/universal-release
-          lipo -create \
-            target/aarch64-apple-darwin/release/libcb_core.a \
-            target/x86_64-apple-darwin/release/libcb_core.a \
-            -output target/release/libcb_core.a
+        run: cargo build --release -p cb-core
 
       - name: Generate Xcode Project
         run: xcodegen generate
@@ -49,10 +25,11 @@ jobs:
             build \
             CB_CODE_SIGNING_ALLOWED=NO
 
-      - name: Package
+      - name: Sign and Package
         run: |
           BUILD_DIR=$(xcodebuild -project CB.xcodeproj -scheme CB -configuration Release -showBuildSettings | grep -m 1 "BUILT_PRODUCTS_DIR" | awk '{print $3}')
-          ditto -c -k --keepParent "$BUILD_DIR/CB.app" CB-${GITHUB_REF_NAME}-universal.zip
+          codesign --force --deep -s - "$BUILD_DIR/CB.app"
+          ditto -c -k --keepParent "$BUILD_DIR/CB.app" CB-${GITHUB_REF_NAME}-arm64.zip
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -60,9 +37,14 @@ jobs:
           generate_release_notes: true
           body: |
             ## Architecture
-            - Universal Binary (Apple Silicon + Intel)
+            - Apple Silicon (arm64)
 
             ## Installation
-            1. Download `CB-${{ github.ref_name }}-universal.zip`
+            1. Download `CB-${{ github.ref_name }}-arm64.zip`
             2. Extract and move `CB.app` to `/Applications`
             3. Launch CB from Applications
+
+            > **Note**: 初回起動時に「開発元を確認できない」と表示される場合は、ターミナルで以下を実行してください:
+            > ```
+            > xattr -cr /Applications/CB.app
+            > ```
