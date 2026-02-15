@@ -217,6 +217,22 @@ impl Storage {
         }
     }
 
+    /// Validate a file path contains only filesystem-safe characters.
+    /// Allowed: alphanumeric, `/`, `\`, `-`, `_`, `.`, ` `, `:`, `~`
+    fn validate_path(path: &str, param_name: &str) -> Result<(), rusqlite::Error> {
+        if path.is_empty()
+            || !path.chars().all(|c| {
+                c.is_alphanumeric()
+                    || matches!(c, '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | '~')
+            })
+        {
+            return Err(rusqlite::Error::InvalidParameterName(
+                format!("{} contains invalid characters (only alphanumeric, /, \\, -, _, ., :, ~, space allowed)", param_name),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn migrate_to_encrypted(
         plain_path: &str,
         encrypted_path: &str,
@@ -225,18 +241,9 @@ impl Storage {
         // Validate inputs to prevent SQL injection in ATTACH DATABASE
         // (parameterized queries are not supported for ATTACH)
 
-        // Whitelist validation for file path: allow only alphanumeric, path separators,
-        // hyphens, underscores, dots, and spaces (common filesystem-safe characters)
-        if encrypted_path.is_empty()
-            || !encrypted_path.chars().all(|c| {
-                c.is_alphanumeric()
-                    || matches!(c, '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | '~')
-            })
-        {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "encrypted_path contains invalid characters (only alphanumeric, /, \\, -, _, ., :, ~, space allowed)".to_string(),
-            ));
-        }
+        // Whitelist validation for file paths
+        Self::validate_path(plain_path, "plain_path")?;
+        Self::validate_path(encrypted_path, "encrypted_path")?;
 
         // Encryption key validation: allow only hex characters and common key formats
         // (alphanumeric, hyphens for UUID-style keys, +/= for base64)
@@ -909,7 +916,27 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_rejects_empty_path() {
+    fn test_migrate_rejects_special_chars_in_plain_path() {
+        let result = Storage::migrate_to_encrypted(
+            "/tmp/plain'; DROP TABLE--",
+            "/tmp/encrypted.db",
+            "valid-key",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_plain_path() {
+        let result = Storage::migrate_to_encrypted(
+            "",
+            "/tmp/encrypted.db",
+            "valid-key",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_encrypted_path() {
         let result = Storage::migrate_to_encrypted(
             "/tmp/plain.db",
             "",
