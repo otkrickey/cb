@@ -37,7 +37,7 @@ macOS標準のクリップボード機能を置き換える高機能クリップ
 │       ├── src/
 │       │   ├── lib.rs           # FFIブリッジ + Storageシングルトン
 │       │   ├── models.rs        # ClipboardEntry, ContentType
-│       │   └── storage.rs       # SQLite CRUD + FTS5 + 暗号化 + ページネーション + touch_entry（27テスト）
+│       │   └── storage.rs       # SQLite CRUD + FTS5 + 暗号化 + ページネーション + touch_entry（28テスト）
 │       └── build.rs             # swift-bridgeコード生成
 ├── CB/CB.entitlements           # アプリエンタイトルメント
 ├── project.yml                  # XcodeGen設定（MARKETING_VERSION管理）
@@ -78,8 +78,8 @@ cargo build --release -p cb-core
 | ホットキー | Carbon Event Manager（デフォルト⌥⌘V、カスタマイズ対応） |
 | 暗号鍵管理 | macOS Keychain（CryptoKit 256bit対称鍵） |
 | 検索 | FTS5全文検索（外部コンテンツテーブル + トリガー同期） |
-| CI/CD | GitHub Actions（ci.yml: テスト・ビルド、release.yml: タグリリース） |
-| 配布 | GitHub Release（zip） / ソースビルド |
+| CI/CD | GitHub Actions（ci.yml: テスト・ビルド・x86_64クロスコンパイル検証、release.yml: タグリリース・Universal Binary） |
+| 配布 | GitHub Release（Universal Binary zip） / ソースビルド |
 
 技術選定の詳細: [docs/design/decisions/001-technology-stack.md](docs/design/decisions/001-technology-stack.md)
 
@@ -99,14 +99,14 @@ cargo build --release -p cb-core
 ### Rust層（ロジック + データ）
 
 - **models**: ClipboardEntry, ContentType（PlainText / RichText / Image / FilePath）。`image_data`は`#[serde(skip)]`でJSON除外。`copy_count`（再コピー回数）と`first_copied_at`（初回コピー日時）を保持
-- **storage**: SQLite CRUD + FTS5全文検索 + カーソルベースページネーション + 自動クリーンアップ + touch_entry（rusqlite bundled-sqlcipher）。`Mutex<Option<Storage>>`シングルトン。SQLCipherによるAES-256ページレベル暗号化。27テスト
-- **ffi**: swift-bridge `#[swift_bridge::bridge]` で12関数を公開（init_storage, migrate_database, save_clipboard_entry, save_clipboard_image, get_recent_entries, delete_entry, get_entry_text, get_entry_image, search_entries, get_entries_before, touch_entry, cleanup_old_entries）
+- **storage**: SQLite CRUD + FTS5全文検索 + カーソルベースページネーション + 自動クリーンアップ + touch_entry（rusqlite bundled-sqlcipher）。`Mutex<Option<Storage>>`シングルトン。SQLCipherによるAES-256ページレベル暗号化。タイムスタンプはミリ秒単位。28テスト
+- **ffi**: swift-bridge `#[swift_bridge::bridge]` で12関数を公開（init_storage, migrate_database, save_clipboard_entry, save_clipboard_image, get_recent_entries, delete_entry, get_entry_text, get_entry_image, search_entries, get_entries_before, touch_entry, cleanup_old_entries）。JSON返却関数は `{"ok": [...]}` / `{"error": "..."}` ラッパー形式
 - DBパス: `~/Library/Application Support/CB/clipboard.db`
 - 詳細: [docs/design/modules/cb-core.md](docs/design/modules/cb-core.md)
 
 ### ロギング
 
-`os.Logger`（subsystem: `com.otkrickey.cb`）でmacOS統合ログに出力。category はファイル単位（`AppDelegate`, `HistoryWindowController`, `ShortcutManager`, `PasteService`, `KeychainManager`）。確認: `log stream --predicate 'subsystem == "com.otkrickey.cb"'`
+`os.Logger`（subsystem: `com.otkrickey.cb`）でmacOS統合ログに出力。category はファイル単位（`AppDelegate`, `HistoryWindowController`, `ShortcutManager`, `PasteService`, `KeychainManager`, `HistoryViewModel`, `ClipboardMonitor`）。確認: `log stream --predicate 'subsystem == "com.otkrickey.cb"'`
 
 ### レイヤー間の責務分離
 

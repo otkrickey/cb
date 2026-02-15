@@ -108,7 +108,7 @@ pub struct ClipboardEntry {
 | `delete_entry(id)` | ID指定DELETE |
 | `get_entry_text(id)` | text_contentのみSELECT |
 | `get_entry_image(id)` | image_dataのみSELECT |
-| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`、ダブルクォートエスケープ対応）。空クエリ時は`get_recent_entries`にフォールバック。画像エントリを除外 |
+| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`、`*`除去・ダブルクォートエスケープによるサニタイズ対応）。空クエリ・サニタイズ後空文字列時は`get_recent_entries`にフォールバック。画像エントリを除外 |
 | `get_entries_before(before_timestamp, limit)` | カーソルベースページネーション（ミリ秒タイムスタンプ）。`before_timestamp <= 0`の場合は`get_recent_entries`にフォールバック。`ORDER BY created_at DESC, id DESC` |
 | `touch_entry(id)` | `created_at`を現在時刻に更新し`copy_count`をインクリメント。エントリがリスト先頭に移動する |
 | `cleanup_old_entries(max_age_days)` | `created_at < (now - max_age_days * 86_400_000)` のエントリをDELETE（ミリ秒単位）。削除件数を返却 |
