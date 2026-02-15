@@ -20,6 +20,20 @@ macOS向け高機能クリップボードマネージャー
 - Rust（stable）
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 
+## インストール
+
+### Homebrew
+
+```bash
+brew install --cask otkrickey/tap/cb
+```
+
+### GitHub Releases
+
+[Releases](https://github.com/otkrickey/cb/releases) から最新の zip をダウンロードし、`CB.app` を `/Applications` に配置。
+
+> 初回起動時に Gatekeeper でブロックされる場合: `xattr -cr /Applications/CB.app`
+
 ## ビルド
 
 ```bash

@@ -31,20 +31,70 @@ jobs:
           codesign --force --deep -s - "$BUILD_DIR/CB.app"
           ditto -c -k --keepParent "$BUILD_DIR/CB.app" CB-${GITHUB_REF_NAME}-arm64.zip
 
+      - name: Calculate SHA256
+        id: sha256
+        run: |
+          SHA256=$(shasum -a 256 CB-${GITHUB_REF_NAME}-arm64.zip | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+
       - uses: softprops/action-gh-release@v2
         with:
           files: CB-*.zip
           generate_release_notes: true
           body: |
-            ## Architecture
-            - Apple Silicon (arm64)
-
             ## Installation
+            ### Homebrew
+            ```
+            brew install --cask otkrickey/tap/cb
+            ```
+            ### Manual
             1. Download `CB-${{ github.ref_name }}-arm64.zip`
             2. Extract and move `CB.app` to `/Applications`
-            3. Launch CB from Applications
+            > 初回起動時: `xattr -cr /Applications/CB.app`
 
-            > **Note**: 初回起動時に「開発元を確認できない」と表示される場合は、ターミナルで以下を実行してください:
-            > ```
-            > xattr -cr /Applications/CB.app
-            > ```
+            ## Checksum
+            SHA256: `${{ steps.sha256.outputs.sha256 }}`
+
+      - name: Update Homebrew Tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          SHA256="${{ steps.sha256.outputs.sha256 }}"
+
+          CASK_CONTENT="cask \"cb\" do
+            version \"$VERSION\"
+            sha256 \"$SHA256\"
+
+            url \"https://github.com/otkrickey/cb/releases/download/v#{version}/CB-v#{version}-arm64.zip\"
+            name \"CB\"
+            desc \"macOS clipboard manager with Liquid Glass design\"
+            homepage \"https://github.com/otkrickey/cb\"
+
+            depends_on macos: \">= :tahoe\"
+            depends_on arch: :arm64
+
+            app \"CB.app\"
+
+            zap trash: [
+              \"~/Library/Application Support/CB\",
+              \"~/Library/Preferences/com.otkrickey.cb.plist\",
+            ]
+
+            caveats <<~EOS
+              CB requires accessibility permission to paste clipboard content to other apps.
+              Grant access at: System Settings > Privacy & Security > Accessibility
+
+              This app is ad-hoc signed. If blocked by Gatekeeper, run:
+                xattr -cr /Applications/CB.app
+            EOS
+          end"
+
+          gh repo clone otkrickey/homebrew-tap tap-repo
+          echo "$CASK_CONTENT" > tap-repo/Casks/cb.rb
+          cd tap-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/cb.rb
+          git commit -m "Update cb to ${VERSION}"
+          git push
