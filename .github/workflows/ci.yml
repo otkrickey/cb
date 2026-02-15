@@ -17,29 +17,13 @@ jobs:
       - name: Cross-compile for x86_64
         run: cargo build --release -p cb-core --target x86_64-apple-darwin
   xcode-build:
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: rust-test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check macOS SDK version
-        id: sdk-check
-        run: |
-          SDK_VERSION=$(xcrun --show-sdk-version)
-          echo "sdk_version=$SDK_VERSION" >> "$GITHUB_OUTPUT"
-          MAJOR=$(echo "$SDK_VERSION" | cut -d. -f1)
-          if [ "$MAJOR" -ge 26 ]; then
-            echo "supported=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "supported=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::macOS SDK $SDK_VERSION does not support Liquid Glass APIs (requires 26.0+). Skipping Xcode build."
-          fi
       - run: brew install xcodegen
-        if: steps.sdk-check.outputs.supported == 'true'
       - run: xcodegen generate
-        if: steps.sdk-check.outputs.supported == 'true'
       - run: cargo build --release -p cb-core
-        if: steps.sdk-check.outputs.supported == 'true'
       - run: xcodebuild -project CB.xcodeproj -scheme CB build CB_CODE_SIGNING_ALLOWED=NO
-        if: steps.sdk-check.outputs.supported == 'true'
