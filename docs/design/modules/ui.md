@@ -87,7 +87,7 @@ SwiftUIビュー、ViewModel、ウィンドウ管理、入力ハンドリング�
 
 **コンテンツ型判定ロジック**:
 - `NSPasteboard.string(forType: .string)` → テキスト取得
-  - 前後空白をトリミング → `/`または`~`始まり、かつ単一行、かつパスパターン正規表現にマッチ → `FilePath`
+  - 前後空白をトリミング → `/`または`~`始まり（チルダ展開対応）、かつ単一行、かつファイルまたは親ディレクトリが`FileManager.fileExists`で存在確認 → `FilePath`
   - それ以外 → `PlainText`
 - `.tiff`または`.png`データ → `Image`
 - コンテンツハッシュで重複をスキップ
@@ -121,8 +121,8 @@ Carbon Event Manager による⌥⌘V グローバルホットキー登録。Use
 
 | メソッド | 説明 |
 |---------|------|
-| `start()` | UserDefaultsから`shortcutKeyCode`/`shortcutModifiers`を読み込み、`RegisterEventHotKey`でホットキー登録。デフォルトは⌥⌘V |
-| `stop()` | `UnregisterEventHotKey`でホットキー解除 |
+| `start()` | UserDefaultsから`shortcutKeyCode`/`shortcutModifiers`を読み込み、`RegisterEventHotKey`でホットキー登録。デフォルトは⌥⌘V。Carbon EventHandlerは初回のみ`InstallEventHandler`でインストール（`eventHandlerInstalled`フラグで多重登録を防止） |
+| `stop()` | `UnregisterEventHotKey`でホットキー解除（EventHandlerは解除しない） |
 | `reregister()` | `stop()` → `start()`で再登録。`UserDefaults.didChangeNotification`監視で設定変更時に自動呼び出し |
 
 コールバックで`onTogglePanel`クロージャを呼び出し。
@@ -154,7 +154,7 @@ Carbon Event Manager による⌥⌘V グローバルホットキー登録。Use
 | `loadMoreEntries()` | Rust FFI `get_entries_before(cursor, 50)` → `FFIResponse`ラッパーデコード → カーソルベースページネーション → `updateFilteredEntries()` |
 | `performSearch()` | デバウンス0.3秒 → Rust FFI `search_entries(query, 50)` → `FFIResponse`ラッパーデコード → `searchResults`更新 → `updateFilteredEntries()` |
 | `cycleTypeFilter()` | `typeFilter`を次の値に切り替え（All → Text → Images → Files → All） → `updateFilteredEntries()` |
-| `loadImage(for:)` | キャッシュヒット時は同期返却。ミス時は`nil`返却 + `Task.detached`で非同期ロード → キャッシュ登録 → UI再描画。`loadingImageIds`で重複ロード防止 |
+| `loadImage(for:)` | キャッシュヒット時は同期返却。ミス時は`nil`返却 + `Task { @MainActor }`で非同期ロード → キャッシュ登録 → UI再描画。`loadingImageIds`で重複ロード防止 |
 | `loadImageData(for:)` | Rust FFI `get_entry_image()` → `Data`として返却（ペースト用） |
 | `deleteEntry(_:)` | Rust FFI `delete_entry()` → 成功時のみローカル配列から削除 → `updateFilteredEntries()`。失敗時は変更なし |
 | `shouldShowDateHeader(at:)` | 日付グループヘッダ表示判定 |
@@ -256,13 +256,15 @@ macOS統合ログシステム（`os.Logger`）を使用。subsystem `com.otkrick
 | `ShortcutManager` | `ShortcutManager` | ホットキー登録/再登録、キー押下検知 |
 | `PasteService` | `PasteService` | AX権限警告、CGEvent生成失敗 |
 | `KeychainManager` | `KeychainManager` | 暗号化キー生成・保存 |
+| `HistoryViewModel` | `HistoryViewModel` | FFIエラーレスポンスのログ出力 |
+| `ClipboardMonitor` | `ClipboardMonitor` | FFI保存失敗のエラーログ出力 |
 
 **ログレベル**:
 - `notice`: 正常動作の記録（起動完了、ホットキー登録成功、パネル操作等）
 - `warning`: 機能制限を伴う状態（AX権限未許可、previousApp不明）
-- `error`: 操作失敗（DB初期化失敗、マイグレーション失敗、Keychainエラー、CGEvent生成失敗）
+- `error`: 操作失敗（DB初期化失敗、マイグレーション失敗、Keychainエラー、CGEvent生成失敗、FFI保存失敗）
 
-**対象外**: `ClipboardMonitor`、`HistoryViewModel`、`SelectionState`、Views（`HistoryPanel`、`ClipboardItemRow`、`SettingsView`、`ShortcutRecorderView`）にはLoggerを使用していない。
+**対象外**: `SelectionState`、Views（`HistoryPanel`、`ClipboardItemRow`、`SettingsView`、`ShortcutRecorderView`）にはLoggerを使用していない。
 
 ---
 

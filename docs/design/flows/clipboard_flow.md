@@ -31,8 +31,8 @@ flowchart TD
     F --> G{コンテンツハッシュ<br/>前回と同一?}
     G -->|同一| C3
     G -->|異なる| H{コンテンツ種別判定}
-    H -->|string取得成功| I{パス判定<br/>トリミング+単一行+正規表現}
-    I -->|パスパターンにマッチ| J[FilePath]
+    H -->|string取得成功| I{パス判定<br/>トリミング+単一行+FileManager存在確認}
+    I -->|ファイルまたは親ディレクトリが存在| J[FilePath]
     I -->|それ以外| K[PlainText]
     H -->|tiff/png取得成功| L[Image]
     H -->|いずれも取得失敗| C3
@@ -71,7 +71,7 @@ flowchart TD
 
 ### 5. FFI呼び出し → SQLite保存
 
-`Task.detached` でバックグラウンドスレッドからRust FFI関数を呼び出し、StorageシングルトンのMutexをロックしてSQLCipher暗号化SQLite INSERTを実行。メインスレッドをブロックしない設計。`created_at`は`SystemTime::now()`のUnixタイムスタンプ。DBは`init_storage(dbPath, encryptionKey)`で暗号化キー付きで初期化済み。
+`Task.detached` でバックグラウンドスレッドからRust FFI関数を呼び出し、StorageシングルトンのMutexをロックしてSQLCipher暗号化SQLite INSERTを実行。メインスレッドをブロックしない設計。`created_at`は`SystemTime::now()`のミリ秒単位Unixタイムスタンプ。DBは`init_storage(dbPath, encryptionKey)`で暗号化キー付きで初期化済み。
 
 ---
 
