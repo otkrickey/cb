@@ -64,12 +64,17 @@ class ClipboardMonitor: ObservableObject {
 
             let isFilePath: Bool = {
                 let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard trimmed.hasPrefix("/") || trimmed.hasPrefix("~") else { return false }
                 // 複数行テキストはパスではない
                 guard !trimmed.contains("\n") else { return false }
-                // パスらしいパターン: スラッシュ区切りのパスコンポーネント
-                let pathPattern = #"^[~/][\w\-./\s]+"#
-                return trimmed.range(of: pathPattern, options: .regularExpression) != nil
+                // ~ で始まる場合はチルダ展開
+                let expanded = trimmed.hasPrefix("~")
+                    ? NSString(string: trimmed).expandingTildeInPath
+                    : trimmed
+                guard expanded.hasPrefix("/") else { return false }
+                // ファイルまたは親ディレクトリが存在すればパスと判定
+                let fm = FileManager.default
+                return fm.fileExists(atPath: expanded)
+                    || fm.fileExists(atPath: (expanded as NSString).deletingLastPathComponent)
             }()
             let contentType = isFilePath ? "FilePath" : "PlainText"
 
