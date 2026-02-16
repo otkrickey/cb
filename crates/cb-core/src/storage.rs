@@ -258,12 +258,17 @@ impl Storage {
         }
 
         let conn = Connection::open(plain_path)?;
+        // Attach without KEY to avoid embedding encryption_key in format!
         conn.execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS encrypted KEY '{}';
-             SELECT sqlcipher_export('encrypted');
-             DETACH DATABASE encrypted;",
-            encrypted_path, encryption_key
+            "ATTACH DATABASE '{}' AS encrypted;",
+            encrypted_path
         ))?;
+        // Set encryption key via PRAGMA (safe from SQL injection)
+        conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
+        conn.execute_batch(
+            "SELECT sqlcipher_export('encrypted');
+             DETACH DATABASE encrypted;"
+        )?;
         Ok(())
     }
 
