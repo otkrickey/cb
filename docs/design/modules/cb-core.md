@@ -260,7 +260,7 @@ INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');
 - 既存 `encrypted_path` への再実行は残骸を削除してから行うことで通る (SQLCipher の未定義挙動をテストで固定)
 
 **マイグレーション異常系 / インジェクション防御**（`test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}` / `test_migrate_rejects_nul_in_path` / `test_escape_sql_string_literal_doubles_apostrophes` / `test_migrate_defends_against_encrypted_path_injection`）:
-- 空文字 / NUL バイト / 鍵内の非許可文字を `InvalidParameterName` で拒否する
+- 空文字 / NUL バイト / 鍵内の非許可文字 (`"abc'; DROP--"` みたいな `'` `;` スペース `-` 混在パターン) を `InvalidParameterName` で拒否する
 - `'` は `''` に確実にエスケープされる (unit test)
 - `evil'; DROP TABLE ...; --` みたいな SQL 破壊パターンを `encrypted_path` に混ぜても、元 DB の clipboard_entries テーブルが破壊されないことを E2E で担保する
 
