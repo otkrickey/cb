@@ -425,9 +425,12 @@ impl Storage {
     /// 平文 DB を暗号化された DB へコピーする（sqlcipher_export ベース）。
     ///
     /// - blob ファイルは DB とは別管理なのでここでは移動しない
-    /// - `encrypted_path` は **存在しないファイル** を指すこと。既存の暗号化 DB
-    ///   に上書きする挙動 (再実行) はサポートしていない。前回失敗の残骸がある
-    ///   場合は呼び出し側であらかじめファイルを削除しておくこと
+    /// - `encrypted_path` は **存在しないファイル** を指すこと。既存ファイルが
+    ///   ある状態で呼ぶと `InvalidParameterName` エラーを返す (SQLCipher の
+    ///   `sqlcipher_export` が未定義動作になる + 生きている暗号化 DB を
+    ///   silently 破壊してしまうリスクがあるため)。呼び出し側で既存ファイルが
+    ///   「壊れた残骸か」「生きている暗号化 DB か」を判別し、後者ならそもそも
+    ///   マイグレーション不要と判断すること
     pub fn migrate_to_encrypted(
         plain_path: &str,
         encrypted_path: &str,
@@ -444,6 +447,14 @@ impl Storage {
         // encryption_key は PRAGMA 経由で渡すので format! には入らないが、
         // 空キーや制御文字を拒否するために検証する。
         Self::validate_encryption_key(encryption_key)?;
+        // 契約: encrypted_path が既存の場合はここでガードする (docstring 参照)。
+        // 呼び出し側の削除忘れ / データ喪失リスクをコードで防ぐ defense-in-depth。
+        if std::path::Path::new(encrypted_path).exists() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "encrypted_path already exists at {}; refuse to overwrite (caller must remove or reuse it)",
+                encrypted_path,
+            )));
+        }
 
         let conn = Connection::open(plain_path)?;
         // encryption_key を format! に埋めず、ATTACH は KEY 無しで実行してから
@@ -1320,11 +1331,40 @@ mod tests {
     }
 
     #[test]
+    fn test_migrate_refuses_existing_encrypted_path() {
+        // 既存の encrypted_path に対しては明示的に InvalidParameterName を返す。
+        // これによりデータ喪失リスクを避け、呼び出し側に判断を委ねる。
+        let dir = std::env::temp_dir().join("cb_test_migrate_refuse_existing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        let encrypted = dir.join("encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "payload", "App").unwrap();
+        }
+        // 予め encrypted_path にダミーファイルを置いておく
+        std::fs::write(&encrypted, b"pretend this is an existing DB").unwrap();
+
+        let err = Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+        // 既存ファイルは触られないこと
+        let content = std::fs::read(&encrypted).unwrap();
+        assert_eq!(content, b"pretend this is an existing DB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_migrate_rerun_requires_caller_to_remove_target() {
-        // encrypted_path が既存の場合の挙動は SQLCipher 側で未定義 (ATTACH 後に
-        // sqlcipher_export で書き込むと "file is not a database" 等になる)。
-        // 呼び出し側でファイルを削除してから再実行することを想定している。
-        // ここでは「残骸を消してから再実行すれば通る」ことを担保する。
+        // 既存 encrypted_path があると Rust 側が Err を返すので、呼び出し側は
+        // ファイルを削除してから再実行する。ここでは「残骸を消してから
+        // 再実行すれば通る」ことを担保する。
         let dir = std::env::temp_dir().join("cb_test_migrate_rerun");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

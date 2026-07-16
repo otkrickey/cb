@@ -96,23 +96,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if fileManager.fileExists(atPath: plainPath) {
-            // cb-core 側の migrate_to_encrypted は「encrypted_path は存在しないこと」
-            // を前提とする。ただしここでの dbPath 事前削除は「稼働中の完全な
-            // 暗号化DB」を誤って消すリスクがあるので、rename でバックアップに
-            // 退避してから移行し、失敗時にロールバックできるようにする
-            // (PR #15 review round 10 指摘)。
-            var backupPath: String? = nil
+            // 曖昧なケース: plainPath と dbPath が両方存在する場合。
+            // (A) 前回中断/クラッシュで作られた不完全な残骸 = 削除して migrate すべき
+            // (B) migrate 成功後にユーザが履歴を追加し、稼働中の暗号化 DB がここにある
+            //     + plainPath 削除だけが一時 I/O エラーで残った = **稼働 DB を消してはいけない**
+            //
+            // ヘッダを見て平文 SQLite 由来か SQLCipher 由来かを判別する。
+            // - "SQLite format 3\0" で始まる or 極端に小さい → (A) 残骸
+            // - それ以外の非平文ヘッダ + 妥当なサイズ → (B) 稼働中の暗号化 DB
+            // (B) の場合は plainPath を stale として削除し、migrate をスキップする。
             if fileManager.fileExists(atPath: dbPath) {
-                let candidate = "\(dbPath).migration-backup-\(Int(Date().timeIntervalSince1970))"
-                do {
-                    try fileManager.moveItem(atPath: dbPath, toPath: candidate)
-                    backupPath = candidate
-                    logger.warning("Moved existing encrypted DB aside for migration retry: \(candidate)")
-                } catch {
-                    logger.error("Failed to move existing encrypted DB aside: \(error). Aborting migration to avoid data loss.")
+                if isEncryptedDatabase(dbPath) {
+                    logger.warning("Both plain and encrypted DB exist; encrypted DB looks live. Treating plain DB as stale leftover from a previous successful migration.")
+                    do {
+                        try fileManager.removeItem(atPath: plainPath)
+                        logger.notice("Removed stale plain DB after previous migration")
+                    } catch {
+                        logger.error("Failed to remove stale plain DB: \(error). Manual cleanup recommended.")
+                    }
                     return
                 }
+                // (A) 残骸: 万一のために rename で退避してから migrate 試行。
+                let backup = "\(dbPath).migration-backup-\(Int(Date().timeIntervalSince1970))"
+                do {
+                    try fileManager.moveItem(atPath: dbPath, toPath: backup)
+                    logger.warning("Moved suspected stale encrypted DB aside: \(backup)")
+                } catch {
+                    logger.error("Failed to move suspected stale encrypted DB aside: \(error). Aborting migration to avoid data loss.")
+                    return
+                }
+                let migrated = migrate_database(plainPath, dbPath, encryptionKey)
+                if migrated {
+                    logger.notice("Successfully re-migrated after moving stale encrypted DB aside")
+                    try? fileManager.removeItem(atPath: plainPath)
+                    try? fileManager.removeItem(atPath: backup)
+                } else {
+                    logger.error("Migration failed after aside; rolling back")
+                    do {
+                        try fileManager.moveItem(atPath: backup, toPath: dbPath)
+                    } catch {
+                        logger.error("Failed to roll back backup at \(backup): \(error). Manual recovery required.")
+                    }
+                }
+                return
             }
+            // 通常ケース: 平文 DB のみ、暗号化 DB は存在しない
             let migrated = migrate_database(plainPath, dbPath, encryptionKey)
             if migrated {
                 logger.notice("Successfully migrated plain DB to encrypted DB")
@@ -122,23 +150,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } catch {
                     logger.error("Failed to remove old plain DB: \(error)")
                 }
-                if let backup = backupPath {
-                    // 新しい暗号化 DB が正常に作れたので古い残骸バックアップは破棄
-                    try? fileManager.removeItem(atPath: backup)
-                }
             } else {
                 logger.error("Database migration failed")
-                // ロールバック: バックアップを dbPath に戻し、plainPath はそのまま残す
-                if let backup = backupPath {
-                    do {
-                        try fileManager.moveItem(atPath: backup, toPath: dbPath)
-                        logger.notice("Rolled back to previous encrypted DB from backup")
-                    } catch {
-                        logger.error("Failed to roll back encrypted DB backup at \(backup): \(error). Manual recovery required.")
-                    }
-                }
             }
         }
+    }
+
+    /// 平文 SQLite ではなく、かつサイズが有意義な (妥当な暗号化 DB とみなせる)
+    /// ファイルかを判定する。厳密な validity check ではないが、
+    /// 「稼働中の SQLCipher DB」と「破損した残骸」を実用的に区別できる。
+    private func isEncryptedDatabase(_ path: String) -> Bool {
+        let fm = FileManager.default
+        let size = (try? fm.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
+        guard size >= 1024 else { return false }
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { handle.closeFile() }
+        let header = handle.readData(ofLength: 16)
+        guard let plainMarker = "SQLite format 3".data(using: .utf8) else { return false }
+        // 平文ヘッダで始まっていれば暗号化ではない
+        return !header.starts(with: plainMarker)
     }
 
     private func isPlainDatabase(_ path: String) -> Bool {
