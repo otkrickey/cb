@@ -102,7 +102,7 @@ cargo build --release -p cb-core
 - **models**: ClipboardEntry, ContentType（PlainText / RichText / Image / FilePath）。`image_data`は`#[serde(skip)]`でJSON除外。`copy_count`（再コピー回数）と`first_copied_at`（初回コピー日時）を保持
 - **storage**: SQLite CRUD + FTS5全文検索 + カーソルベースページネーション + 自動クリーンアップ + touch_entry + blob 参照統合（rusqlite bundled-sqlcipher）。`Mutex<Option<Storage>>`シングルトン。SQLCipherによるAES-256ページレベル暗号化。タイムスタンプはミリ秒単位。テキストは256KBを超えると外部化。53テスト
 - **blob_store**: 大サイズコンテンツ (256KB超テキスト・全画像) を `<blob_dir>/<sha256>.bin` に保管する外部ストア。SHA-256 名で dedup、cleanup 時に孤児 GC。7テスト
-- **ffi**: swift-bridge `#[swift_bridge::bridge]` で12関数を公開（init_storage, migrate_database, save_clipboard_entry, save_clipboard_image, get_recent_entries, delete_entry, get_entry_text, get_entry_image, search_entries, get_entries_before, touch_entry, cleanup_old_entries）。JSON返却関数は `{"ok": [...]}` / `{"error": "..."}` ラッパー形式
+- **ffi**: swift-bridge `#[swift_bridge::bridge]` で17関数を公開（init_storage, migrate_database, save_clipboard_entry, save_clipboard_image, save_clipboard_text_v2, save_clipboard_blob_ref, get_recent_entries, delete_entry, get_entry_text, get_entry_image, get_entry_blob_sha256, is_blob_missing, blob_dir_path, search_entries, get_entries_before, touch_entry, cleanup_old_entries）。旧FFI (`save_clipboard_entry` / `save_clipboard_image`) は BC 用途で残置。JSON返却関数は `{"ok": [...]}` / `{"error": "..."}` ラッパー形式
 - DBパス: `~/Library/Application Support/CB/clipboard.db`
 - 詳細: [docs/design/modules/cb-core.md](docs/design/modules/cb-core.md)
 

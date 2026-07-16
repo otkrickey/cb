@@ -58,16 +58,21 @@ Rustで実装されたコアライブラリ。データモデル定義、SQLite�
 |------|-----------|------|
 | `init_storage` | `fn(db_path: String, encryption_key: String) -> bool` | Storageシングルトン初期化（暗号化キー付き） |
 | `migrate_database` | `fn(plain_path: String, encrypted_path: String, encryption_key: String) -> bool` | 平文DB→暗号化DBマイグレーション |
-| `save_clipboard_entry` | `fn(content_type: String, text: String, source_app: String) -> bool` | テキスト系エントリ保存 |
-| `save_clipboard_image` | `fn(image_data: &[u8], source_app: String) -> bool` | 画像エントリ保存 |
+| `save_clipboard_entry` | `fn(content_type: String, text: String, source_app: String) -> bool` | (旧FFI) テキスト系エントリ保存。Rust 側で閾値判定して自動 externalize |
+| `save_clipboard_image` | `fn(image_data: &[u8], source_app: String) -> bool` | (旧FFI) 画像エントリ保存 |
+| `save_clipboard_text_v2` | `fn(content_type: String, preview: String, text_content_or_empty: String, blob_sha256_or_empty: String, byte_size: i64, source_app: String) -> bool` | (新FFI) Swift 側で外部化判断・sha256 計算済のテキスト保存。inline は `text_content_or_empty`、外部化は `blob_sha256_or_empty` に |
+| `save_clipboard_blob_ref` | `fn(content_type: String, preview: String, blob_sha256: String, byte_size: i64, source_app: String) -> bool` | (新FFI) Swift 側で blob ファイルを書き終えた大サイズエントリの参照だけを DB に登録 |
 | `get_recent_entries` | `fn(limit: i32) -> String` | 最新N件をJSONラッパー `{"ok": [...]}` で返却。エラー時は `{"error": "..."}` |
 | `delete_entry` | `fn(id: i64) -> bool` | ID指定で削除 |
-| `get_entry_text` | `fn(id: i64) -> Option<String>` | テキスト内容取得 |
-| `get_entry_image` | `fn(id: i64) -> Option<Vec<u8>>` | 画像バイト列取得 |
+| `get_entry_text` | `fn(id: i64) -> Option<String>` | テキスト内容取得。外部化エントリは blob から読み出す (失敗時は preview へ fallback) |
+| `get_entry_image` | `fn(id: i64) -> Option<Vec<u8>>` | 画像バイト列取得。外部化エントリは blob から読み出す |
+| `get_entry_blob_sha256` | `fn(id: i64) -> Option<String>` | 外部化エントリの blob SHA-256 を返却 (inline エントリは `None`) |
+| `is_blob_missing` | `fn(id: i64) -> bool` | 外部化エントリの blob ファイルが実在しないか (整合性チェック用) |
+| `blob_dir_path` | `fn() -> String` | blob 保管ディレクトリの絶対パス |
 | `search_entries` | `fn(query: String, limit: i32) -> String` | FTS5全文検索（前方一致）。JSONラッパー形式 |
 | `get_entries_before` | `fn(before_timestamp: i64, limit: i32) -> String` | カーソルベースページネーション（ミリ秒タイムスタンプ）。JSONラッパー形式 |
 | `touch_entry` | `fn(id: i64) -> bool` | `created_at`を現在時刻に更新 + `copy_count`をインクリメント |
-| `cleanup_old_entries` | `fn(max_age_days: i32) -> i64` | 指定日数より古いエントリを削除 |
+| `cleanup_old_entries` | `fn(max_age_days: i32) -> i64` | 指定日数より古いエントリを削除。同時に参照が消えた blob ファイルも GC |
 
 ### データモデル（`models.rs`）
 
@@ -83,9 +88,12 @@ pub enum ContentType {
 pub struct ClipboardEntry {
     pub id: i64,
     pub content_type: ContentType,
-    pub text_content: Option<String>,
+    pub text_preview: Option<String>,     // 先頭 PREVIEW_BYTES (8KB) の UTF-8 抜粋 (FTS5 索引対象)
+    pub text_content: Option<String>,     // 閾値未満のフルテキスト (外部化時は None)
+    pub blob_sha256: Option<String>,      // 外部化時のみ設定される blob 参照
+    pub byte_size: i64,                   // フル本文/画像のバイト数
     #[serde(skip)]
-    pub image_data: Option<Vec<u8>>,
+    pub image_data: Option<Vec<u8>>,      // 常に外部化されるので JSON からも除外
     pub source_app: Option<String>,
     pub created_at: i64,
     pub copy_count: i64,
@@ -93,25 +101,40 @@ pub struct ClipboardEntry {
 }
 ```
 
-`image_data`は`#[serde(skip)]`でJSONシリアライズから除外され、`get_entry_image()`で個別取得する設計。`copy_count`は再コピー回数（初回は1）、`first_copied_at`は最初のコピー日時（`touch_entry`で`created_at`が更新されても保持）。`created_at`と`first_copied_at`はミリ秒単位のUnixタイムスタンプ。
+大サイズコンテンツは inline (`text_content` / `image_data`) から外部 blob ファイル (`~/Library/Application Support/CB/blobs/<sha256>.bin`) に切り出される:
+
+- テキストは `TEXT_EXTERNALIZE_THRESHOLD_BYTES` (256KB) を超えたら外部化。`text_content` は `None` になり、`blob_sha256` が設定される
+- 画像は常に外部化 (`save_clipboard_blob_ref` 経由)
+- 検索用の `text_preview` は最大 `PREVIEW_BYTES` (8KB) のみ FTS5 に載る → 8KB を超える部分は検索不可
+- `byte_size` はフルサイズを保持 (UI のサイズ表示用)
+- `image_data`は`#[serde(skip)]`でJSONシリアライズから除外され、`get_entry_image()`で個別取得する設計
+- `copy_count`は再コピー回数（初回は1）、`first_copied_at`は最初のコピー日時（`touch_entry`で`created_at`が更新されても保持）
+- `created_at`と`first_copied_at`はミリ秒単位のUnixタイムスタンプ
 
 ### Storage（`storage.rs`）
 
 | メソッド | 説明 |
 |---------|------|
-| `Storage::new(db_path, encryption_key)` | DB初期化・暗号化キー設定（`PRAGMA key`）・スキーマ作成 |
-| `Storage::new_in_memory()` | テスト用インメモリDB |
+| `Storage::new(db_path, encryption_key)` | DB初期化・暗号化キー設定（`PRAGMA key`）・スキーマ作成。blob 保管ディレクトリは DB と同階層の `blobs/` |
+| `Storage::new_with_blob_dir(db_path, encryption_key, blob_dir)` | blob 保管ディレクトリを明示指定して初期化 (テスト用) |
+| `Storage::new_in_memory()` | テスト用インメモリDB (blob は一意な一時ディレクトリ) |
 | `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。両パスは空/NUL のみ拒否し、`encrypted_path` を format! で ATTACH 文に埋め込む前に `'` を `''` にエスケープ (`escape_sql_string_literal`)。`encryption_key` は `pragma_update` 経由で設定し format! に埋め込まない (併せて `validate_encryption_key` で空・不正文字を拒否)。macOS の `O'Brien` のような特殊文字を含むユーザディレクトリ配下でも動作する |
-| `insert_text_entry(content_type, text, source_app)` | テキスト系INSERT |
-| `insert_image_entry(image_data, source_app)` | 画像INSERT（BLOB） |
+| `blob_store()` | 内部の `BlobStore` への参照。外部から blob 保管ルートを取得する用途 |
+| `insert_text_entry(content_type, text, source_app)` | テキスト系INSERT。閾値超なら Rust 側で自動 externalize |
+| `insert_image_entry(image_data, source_app)` | 画像INSERT。常に blob 外部化 |
+| `insert_prepared_text(...)` | Swift 側で preview / text_content / blob_sha256 / byte_size を用意済のテキスト保存 |
+| `insert_prepared_blob_ref(...)` | Swift 側で blob 書込済の大サイズエントリの参照だけを DB に登録 |
 | `get_recent_entries(limit)` | `created_at DESC, id DESC` で最新N件取得（ソート安定性保証） |
 | `delete_entry(id)` | ID指定DELETE |
-| `get_entry_text(id)` | text_contentのみSELECT |
-| `get_entry_image(id)` | image_dataのみSELECT |
-| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`）。特殊文字 `*` / `^` / `+` を除去しダブルクォートを `""` にエスケープ。boolean 演算子 (AND/OR/NOT/NEAR) は phrase 内では元々演算子として解釈されないため意図的に触らない (通常英文の破壊回避)。空クエリ・サニタイズ後空文字列時は`get_recent_entries`にフォールバック。画像エントリを除外 |
+| `get_entry_text(id)` | フル本文取得。外部化エントリは blob から読み、欠損時は preview へ fallback |
+| `get_entry_image(id)` | 画像バイト列取得。外部化エントリは blob から読み出す |
+| `get_entry_blob_sha256(id)` | 外部化エントリの blob SHA-256 (inline は None) |
+| `is_blob_missing(id)` | 外部化エントリの blob ファイルが実在しないか (整合性チェック) |
+| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`）。特殊文字 `*` / `^` / `+` を除去しダブルクォートを `""` にエスケープ。boolean 演算子 (AND/OR/NOT/NEAR) は phrase 内では元々演算子として解釈されないため意図的に触らない (通常英文の破壊回避)。空クエリ・サニタイズ後空文字列時は`get_recent_entries`にフォールバック。画像エントリを除外。**索引対象は `text_preview` (最大 8KB) なのでそれを超える本文は検索不可** |
 | `get_entries_before(before_timestamp, limit)` | カーソルベースページネーション（ミリ秒タイムスタンプ）。`before_timestamp <= 0`の場合は`get_recent_entries`にフォールバック。`ORDER BY created_at DESC, id DESC` |
 | `touch_entry(id)` | `created_at`を現在時刻に更新し`copy_count`をインクリメント。エントリがリスト先頭に移動する |
-| `cleanup_old_entries(max_age_days)` | `created_at < (now - max_age_days * 86_400_000)` のエントリをDELETE（ミリ秒単位）。削除件数を返却 |
+| `cleanup_old_entries(max_age_days)` | `created_at < (now - max_age_days * 86_400_000)` のエントリをDELETE（ミリ秒単位）+ 参照が消えた blob を GC。削除件数を返却 |
+| `list_referenced_blobs()` | DB から参照されている blob SHA-256 の一覧を返す (GC 判定用) |
 
 ---
 
