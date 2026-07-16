@@ -411,17 +411,6 @@ impl Storage {
         Ok(())
     }
 
-    /// FTS5 の演算子 (`AND` / `OR` / `NOT` / `NEAR`) を単語単位で除去する。
-    /// 部分一致による "android" 等の誤検出を避けるため、大文字化した完全一致のみを弾く。
-    fn remove_fts5_operators(input: &str) -> String {
-        const OPS: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
-        input
-            .split_whitespace()
-            .filter(|w| !OPS.contains(&w.to_uppercase().as_str()))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
     /// 平文 DB を暗号化された DB へコピーする（sqlcipher_export ベース）。
     /// blob ファイルは DB とは別管理なのでここでは移動しない。
     pub fn migrate_to_encrypted(
@@ -457,16 +446,19 @@ impl Storage {
         if trimmed.is_empty() {
             return self.get_recent_entries(limit);
         }
-        // FTS5 サニタイズ 3 段:
+        // FTS5 サニタイズ:
         // 1) `*` `^` `+` は phrase 内でも FTS5 構文として解釈されうるので除去
+        // 2) ダブルクォートは phrase 区切りなのでエスケープ
+        //
+        // AND/OR/NOT/NEAR 等の boolean 演算子はここでは触らない: 最終的に
+        // 全体を `"..."*` フレーズで括るので、フレーズ内では既に演算子として
+        // 解釈されない (FTS5 仕様)。単語単位で除去すると "salt and pepper" 等の
+        // 通常英文が破壊されて regression になる (PR #15 review 指摘)。
         let sanitized: String = trimmed
             .chars()
             .filter(|c| !matches!(c, '*' | '^' | '+'))
             .collect();
-        // 2) ダブルクォートは phrase 区切りなのでエスケープ
         let escaped = sanitized.replace('"', "\"\"");
-        // 3) boolean 演算子 (AND / OR / NOT / NEAR) を単語単位で除去
-        let escaped = Self::remove_fts5_operators(&escaped);
         let escaped = escaped.trim();
         if escaped.is_empty() {
             return self.get_recent_entries(limit);
@@ -1097,58 +1089,59 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_search_sanitizes_fts5_operators() {
-        // AND / OR / NOT / NEAR がユーザ入力に混ざっていても FTS5 構文として
-        // 解釈されず、単なる語として扱われて 0 件で通ることを検証する。
-        let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "hello world", "App").unwrap();
-        // "AND" 単独ワードは除去され、実クエリは空になって fallback で全件返却される。
-        let results = storage.search_entries("AND", 10).unwrap();
-        assert_eq!(results.len(), 1, "AND のみのクエリは全件 fallback になる");
-    }
-
-    #[test]
-    fn test_search_sanitizes_near_operator() {
-        let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "cat sat mat", "App").unwrap();
-        // "NEAR" は除去されて "cat sat" (隣接) になり phrase match が成立する。
-        let results = storage.search_entries("cat NEAR sat", 10).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_search_sanitizes_not_operator() {
-        let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "keep me", "App").unwrap();
-        // "NOT keep" が生の FTS5 構文で通ると意図しない除外が起きる。除去された結果 "keep" が残る。
-        let results = storage.search_entries("NOT keep", 10).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_search_sanitizes_special_chars() {
+    fn test_search_special_chars_do_not_break_query() {
+        // `*` `^` `+` を混ぜても FTS5 構文エラーにならず、除去された残り文字列で
+        // フレーズ検索されること。
         let storage = Storage::new_in_memory().unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "prefix content", "App").unwrap();
-        // `*` `^` `+` を混ぜても FTS5 構文エラーにならない。
         let results = storage.search_entries("prefix*^+", 10).unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
-    fn test_search_operator_words_are_not_partial_match() {
-        // "android" のような単語の中に "and" があっても除去されないこと (完全一致でのみ弾く)。
+    fn test_search_double_quotes_are_escaped() {
+        // クエリ内の `"` を素通ししない ("" にエスケープ) こと。エスケープを
+        // 忘れると `"foo"bar"` みたいなクエリでフレーズが早く閉じて構文エラーになる。
         let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "android notable", "App").unwrap();
-        let results = storage.search_entries("android", 10).unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "say hello", "App").unwrap();
+        // ダブルクォート混じりでも panic せず、エラーにならないこと。
+        let _ = storage.search_entries(r#"say "hello""#, 10).unwrap();
+    }
+
+    // Regression tests (PR #15 review): 演算子相当の英単語を含む実データが
+    // 検索できなくなっていた回帰。フレーズ内では AND/OR/NOT/NEAR は元々演算子
+    // として解釈されないので、単語除去は撤去済み。
+
+    #[test]
+    fn test_search_finds_text_containing_and() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "salt and pepper", "App").unwrap();
+        let results = storage.search_entries("salt and pepper", 10).unwrap();
+        assert_eq!(results.len(), 1, "\"salt and pepper\" は自己再検索でヒットすべき");
+    }
+
+    #[test]
+    fn test_search_finds_text_containing_or() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "cash or credit", "App").unwrap();
+        let results = storage.search_entries("cash or credit", 10).unwrap();
         assert_eq!(results.len(), 1);
     }
 
     #[test]
-    fn test_remove_fts5_operators_isolates_whole_words() {
-        assert_eq!(Storage::remove_fts5_operators("foo AND bar"), "foo bar");
-        assert_eq!(Storage::remove_fts5_operators("android"), "android"); // 部分一致は残す
-        assert_eq!(Storage::remove_fts5_operators("Or OR or"), ""); // 大文字小文字混在でも
-        assert_eq!(Storage::remove_fts5_operators("NEAR NEAR"), "");
+    fn test_search_finds_text_containing_not() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "do not disturb", "App").unwrap();
+        let results = storage.search_entries("do not disturb", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_finds_text_containing_near() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "walk near park", "App").unwrap();
+        let results = storage.search_entries("walk near park", 10).unwrap();
+        assert_eq!(results.len(), 1);
     }
 
     #[test]

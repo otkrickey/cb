@@ -101,14 +101,14 @@ pub struct ClipboardEntry {
 |---------|------|
 | `Storage::new(db_path, encryption_key)` | DB初期化・暗号化キー設定（`PRAGMA key`）・スキーマ作成 |
 | `Storage::new_in_memory()` | テスト用インメモリDB |
-| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。`encrypted_path`/`encryption_key`に`'`/`\0`が含まれる場合はSQLインジェクション防止のためエラー返却 |
+| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。`plain_path` / `encrypted_path` / `encryption_key` すべてをホワイトリスト検証 (`validate_path` / `validate_encryption_key`) してから ATTACH。encryption_key は `pragma_update` 経由で設定し format! に埋め込まない |
 | `insert_text_entry(content_type, text, source_app)` | テキスト系INSERT |
 | `insert_image_entry(image_data, source_app)` | 画像INSERT（BLOB） |
 | `get_recent_entries(limit)` | `created_at DESC, id DESC` で最新N件取得（ソート安定性保証） |
 | `delete_entry(id)` | ID指定DELETE |
 | `get_entry_text(id)` | text_contentのみSELECT |
 | `get_entry_image(id)` | image_dataのみSELECT |
-| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`、`*`除去・ダブルクォートエスケープによるサニタイズ対応）。空クエリ・サニタイズ後空文字列時は`get_recent_entries`にフォールバック。画像エントリを除外 |
+| `search_entries(query, limit)` | FTS5 MATCHクエリ（フレーズ前方一致 `"query"*`）。特殊文字 `*` / `^` / `+` を除去しダブルクォートを `""` にエスケープ。boolean 演算子 (AND/OR/NOT/NEAR) は phrase 内では元々演算子として解釈されないため意図的に触らない (通常英文の破壊回避)。空クエリ・サニタイズ後空文字列時は`get_recent_entries`にフォールバック。画像エントリを除外 |
 | `get_entries_before(before_timestamp, limit)` | カーソルベースページネーション（ミリ秒タイムスタンプ）。`before_timestamp <= 0`の場合は`get_recent_entries`にフォールバック。`ORDER BY created_at DESC, id DESC` |
 | `touch_entry(id)` | `created_at`を現在時刻に更新し`copy_count`をインクリメント。エントリがリスト先頭に移動する |
 | `cleanup_old_entries(max_age_days)` | `created_at < (now - max_age_days * 86_400_000)` のエントリをDELETE（ミリ秒単位）。削除件数を返却 |
@@ -202,7 +202,7 @@ DBファイル: `~/Library/Application Support/CB/clipboard.db`
 
 | ファイル | テスト数 | 対象 |
 |----------|----------|------|
-| `crates/cb-core/src/storage.rs` | 28個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート |
+| `crates/cb-core/src/storage.rs` | 58個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E) |
 
 ### 重要なテストケース
 
