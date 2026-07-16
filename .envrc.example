@@ -1,0 +1,55 @@
+# このrepoで別のGitHubアカウントを使うためのテンプレート
+#
+# 方針: gh CLI の設定を repo ローカルに閉じ込め、OAuth (ブラウザ) で認証する。
+#   PAT (Personal Access Token) 発行は不要。
+#   他 repo では通常どおり ~/.config/gh/ を使う。
+#
+# 使い方:
+#   1. cp .envrc.example .envrc
+#   2. direnv allow
+#   3. gh auth login          # ブラウザで別アカウントを OAuth 認証
+#   4. gh api user --jq '"export GIT_AUTHOR_EMAIL=\"\(.id)+\(.login)@users.noreply.github.com\""'
+#      → 出力行を .envrc の下記 GIT_AUTHOR_EMAIL に貼り付け（数字ID+username の noreply 形式）
+#   5. GIT_AUTHOR_NAME に自分の表示名を書く
+#   6. direnv reload
+#   7. HTTPS push のため（初回のみ）:
+#        git config --local credential.helper '!gh auth git-credential'
+#
+# .envrc, .gh/ ともに .gitignore の allowlist に含まれない → 自動除外
+# 秘匿性のため:
+#   chmod 600 .envrc
+#   chmod 700 .gh
+#   （.gh/hosts.yml は gh が自動で 600 に設定する）
+
+# ─────────────────────────────────────────────
+# 1. gh CLI 設定を repo ローカルに閉じ込め
+# ─────────────────────────────────────────────
+export GH_CONFIG_DIR="$PWD/.gh"
+mkdir -p "$GH_CONFIG_DIR"
+
+# ─────────────────────────────────────────────
+# 2. Git commit の author / committer
+# ─────────────────────────────────────────────
+# noreply email 取得:
+#   gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"'
+# gh auth login 後に上を実行して結果を GIT_AUTHOR_EMAIL に設定する
+export GIT_AUTHOR_NAME="Your Personal Name"
+export GIT_AUTHOR_EMAIL="XXXXXXXX+yourusername@users.noreply.github.com"
+export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+
+# ─────────────────────────────────────────────
+# 3. (Optional) SSH remote 使用時
+# ─────────────────────────────────────────────
+# 現在の remote: https://github.com/otkrickey/cb  (HTTPS)
+# SSH に切り替えたい場合:
+#   git remote set-url origin git@github.com:otkrickey/cb.git
+# 別アカウント用の SSH 鍵を作った場合はこれを有効化:
+# export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_personal -o IdentitiesOnly=yes"
+
+# ─────────────────────────────────────────────
+# 4. 動作確認
+# ─────────────────────────────────────────────
+# gh auth status          → 別アカウントでログインしている状態が出る
+# gh api user --jq .login → 別ユーザー名が返る
+# cd ~ で外に出て gh auth status → 元アカウントに戻っている（GH_CONFIG_DIR未設定に戻るため）

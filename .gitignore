@@ -3,6 +3,7 @@
 
 # ルートファイル
 !.gitignore
+!.envrc.example
 !CLAUDE.md
 !README.md
 !LICENSE
