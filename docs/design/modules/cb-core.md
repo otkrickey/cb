@@ -101,7 +101,7 @@ pub struct ClipboardEntry {
 |---------|------|
 | `Storage::new(db_path, encryption_key)` | DB初期化・暗号化キー設定（`PRAGMA key`）・スキーマ作成 |
 | `Storage::new_in_memory()` | テスト用インメモリDB |
-| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。`plain_path` / `encrypted_path` / `encryption_key` すべてをホワイトリスト検証 (`validate_path` / `validate_encryption_key`) してから ATTACH。encryption_key は `pragma_update` 経由で設定し format! に埋め込まない |
+| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。`encrypted_path` (SQL文字列に埋め込む) と `encryption_key` はホワイトリスト検証 (`validate_path` / `validate_encryption_key`) してから ATTACH。`encryption_key` は `pragma_update` 経由で設定し format! に埋め込まない。`plain_path` は `Connection::open` にしか渡さないため空チェックのみ |
 | `insert_text_entry(content_type, text, source_app)` | テキスト系INSERT |
 | `insert_image_entry(image_data, source_app)` | 画像INSERT（BLOB） |
 | `get_recent_entries(limit)` | `created_at DESC, id DESC` で最新N件取得（ソート安定性保証） |
@@ -202,7 +202,7 @@ DBファイル: `~/Library/Application Support/CB/clipboard.db`
 
 | ファイル | テスト数 | 対象 |
 |----------|----------|------|
-| `crates/cb-core/src/storage.rs` | 51個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E) |
+| `crates/cb-core/src/storage.rs` | 52個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E/plain_path 記号許容/再実行) |
 | `crates/cb-core/src/blob_store.rs` | 7個 | blob 書き込み・読み出し・存在チェック・dedup・GC・削除 |
 
 ### 重要なテストケース
@@ -225,11 +225,13 @@ DBファイル: `~/Library/Application Support/CB/clipboard.db`
 **暗号化異常系**（`test_encrypted_db_wrong_key_fails`）:
 - 間違った暗号化キーでのDB読み出しが失敗する
 
-**マイグレーション**（`test_migrate_to_encrypted` / `test_migrate_accepts_valid_path_and_key`）:
+**マイグレーション**（`test_migrate_to_encrypted` / `test_migrate_accepts_valid_path_and_key` / `test_migrate_accepts_plain_path_with_special_chars` / `test_migrate_rerun_requires_caller_to_remove_target`）:
 - `sqlcipher_export`による平文→暗号化DB変換が正しく動作する。ホワイトリスト検証済のパス・鍵で E2E に成功する
+- `plain_path` に `'` `(` `)` 等の記号を含む macOS 上正当なパスもそのまま通す (encrypted_path のみ厳格)
+- 既存 `encrypted_path` への再実行は残骸を削除してから行うことで通る (SQLCipher の未定義挙動をテストで固定)
 
-**マイグレーション異常系**（`test_migrate_rejects_single_quote_in_path` / `test_migrate_rejects_semicolon_in_path` / `test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_special_chars_in_plain_path` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}`）:
-- `'` / `;` / `$` 等の非許可文字を含むパス・鍵、および空文字を `InvalidParameterName` で拒否する
+**マイグレーション異常系**（`test_migrate_rejects_single_quote_in_encrypted_path` / `test_migrate_rejects_semicolon_in_encrypted_path` / `test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}`）:
+- `'` / `;` 等の非許可文字を含む `encrypted_path` (SQL 埋め込み対象)、`$` 等を含む鍵、および空文字の各引数を `InvalidParameterName` で拒否する
 
 **FTS5検索**（`test_search_entries_basic` / `test_search_entries_prefix_match` / `test_search_entries_empty_query_fallback` / `test_search_entries_delete_sync`）:
 - 基本的な全文検索、前方一致（`query*`）、空クエリのフォールバック、DELETE後のFTS同期
