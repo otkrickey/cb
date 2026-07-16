@@ -96,17 +96,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if fileManager.fileExists(atPath: plainPath) {
-            // 残骸 (前回の中断/クラッシュで作られた不完全な encrypted DB) が dbPath に
-            // 存在すると migrate_database (ATTACH → sqlcipher_export) が SQLCipher レベル
-            // で未定義動作になり、以降起動のたびにマイグレーションが再失敗し続ける。
-            // 呼び出し前にファイルを削除して cb-core 側の前提 (encrypted_path は存在しない)
-            // を満たす。
+            // cb-core 側の migrate_to_encrypted は「encrypted_path は存在しないこと」
+            // を前提とする。ただしここでの dbPath 事前削除は「稼働中の完全な
+            // 暗号化DB」を誤って消すリスクがあるので、rename でバックアップに
+            // 退避してから移行し、失敗時にロールバックできるようにする
+            // (PR #15 review round 10 指摘)。
+            var backupPath: String? = nil
             if fileManager.fileExists(atPath: dbPath) {
-                logger.warning("Removing stale encrypted DB residue at \(dbPath) before migration retry")
+                let candidate = "\(dbPath).migration-backup-\(Int(Date().timeIntervalSince1970))"
                 do {
-                    try fileManager.removeItem(atPath: dbPath)
+                    try fileManager.moveItem(atPath: dbPath, toPath: candidate)
+                    backupPath = candidate
+                    logger.warning("Moved existing encrypted DB aside for migration retry: \(candidate)")
                 } catch {
-                    logger.error("Failed to remove stale encrypted DB residue: \(error)")
+                    logger.error("Failed to move existing encrypted DB aside: \(error). Aborting migration to avoid data loss.")
                     return
                 }
             }
@@ -119,8 +122,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } catch {
                     logger.error("Failed to remove old plain DB: \(error)")
                 }
+                if let backup = backupPath {
+                    // 新しい暗号化 DB が正常に作れたので古い残骸バックアップは破棄
+                    try? fileManager.removeItem(atPath: backup)
+                }
             } else {
                 logger.error("Database migration failed")
+                // ロールバック: バックアップを dbPath に戻し、plainPath はそのまま残す
+                if let backup = backupPath {
+                    do {
+                        try fileManager.moveItem(atPath: backup, toPath: dbPath)
+                        logger.notice("Rolled back to previous encrypted DB from backup")
+                    } catch {
+                        logger.error("Failed to roll back encrypted DB backup at \(backup): \(error). Manual recovery required.")
+                    }
+                }
             }
         }
     }
