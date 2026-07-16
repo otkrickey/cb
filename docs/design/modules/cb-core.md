@@ -131,7 +131,7 @@ static STORAGE: Mutex<Option<Storage>> = Mutex::new(None);
 `rusqlite`の`bundled-sqlcipher`フィーチャーにより、SQLCipherによるAES-256ページレベル暗号化を実現:
 - `Storage::new()`で`PRAGMA key`を設定し、透過的に暗号化/復号
 - `encryption_key`が空文字列の場合は暗号化なし（テスト互換）
-- `migrate_to_encrypted()`で既存の平文DBを`sqlcipher_export`で暗号化DBへ変換（ATTACH DATABASE文はパラメータ化不可のため、入力値の`'`/`\0`チェックでSQLインジェクションを防止）
+- `migrate_to_encrypted()`で既存の平文DBを`sqlcipher_export`で暗号化DBへ変換。`encrypted_path`は`validate_path`のホワイトリスト検証、暗号化キーは`validate_encryption_key`で検証してから`pragma_update`経由で設定（format!に埋め込まないためSQLインジェクションを構造的に防止）。`plain_path`は`Connection::open`にしか渡さないため空チェックのみ
 - 暗号化キーはSwift側の`KeychainManager`がmacOS Keychainから取得・管理
 
 ### DBスキーマ
