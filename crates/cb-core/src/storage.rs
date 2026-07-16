@@ -376,6 +376,52 @@ impl Storage {
         })
     }
 
+    /// ATTACH DATABASE で使うパスをホワイトリスト検証する。
+    /// ATTACH はパラメータ化クエリを受け付けないため、format! で埋め込む前に
+    /// SQL インジェクションを構造的に不可能にする。
+    /// 許可: 英数字 / `/` `\` `-` `_` `.` ` ` `:` `~`
+    fn validate_path(path: &str, param_name: &str) -> Result<(), rusqlite::Error> {
+        if path.is_empty()
+            || !path.chars().all(|c| {
+                c.is_alphanumeric()
+                    || matches!(c, '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | '~')
+            })
+        {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "{} contains invalid characters (only alphanumeric, /, \\, -, _, ., :, ~, space allowed)",
+                param_name,
+            )));
+        }
+        Ok(())
+    }
+
+    /// 暗号化キーの許可文字集合をホワイトリスト検証する。
+    /// hex 単独ではなく、UUID(hyphen) や base64(+/=) 由来のキーも許可する。
+    fn validate_encryption_key(key: &str) -> Result<(), rusqlite::Error> {
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '+' | '/' | '='))
+        {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "encryption_key contains invalid characters (only alphanumeric, -, +, /, = allowed)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// FTS5 の演算子 (`AND` / `OR` / `NOT` / `NEAR`) を単語単位で除去する。
+    /// 部分一致による "android" 等の誤検出を避けるため、大文字化した完全一致のみを弾く。
+    fn remove_fts5_operators(input: &str) -> String {
+        const OPS: [&str; 4] = ["AND", "OR", "NOT", "NEAR"];
+        input
+            .split_whitespace()
+            .filter(|w| !OPS.contains(&w.to_uppercase().as_str()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// 平文 DB を暗号化された DB へコピーする（sqlcipher_export ベース）。
     /// blob ファイルは DB とは別管理なのでここでは移動しない。
     pub fn migrate_to_encrypted(
@@ -383,24 +429,26 @@ impl Storage {
         encrypted_path: &str,
         encryption_key: &str,
     ) -> Result<(), rusqlite::Error> {
-        if encrypted_path.contains('\'') || encrypted_path.contains('\0') {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "encrypted_path contains invalid characters".to_string(),
-            ));
-        }
-        if encryption_key.contains('\'') || encryption_key.contains('\0') {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "encryption_key contains invalid characters".to_string(),
-            ));
-        }
+        // ATTACH DATABASE はパラメータ化クエリを受け付けないため、format! で埋め込む
+        // plain_path / encrypted_path をホワイトリストで事前検証して SQL インジェクションを防ぐ。
+        Self::validate_path(plain_path, "plain_path")?;
+        Self::validate_path(encrypted_path, "encrypted_path")?;
+        // encryption_key は PRAGMA 経由で渡すので format! には入らないが、
+        // 空キーや制御文字を拒否するために検証する。
+        Self::validate_encryption_key(encryption_key)?;
 
         let conn = Connection::open(plain_path)?;
+        // encryption_key を format! に埋めず、ATTACH は KEY 無しで実行してから
+        // pragma_update で安全に鍵をセットする。
         conn.execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS encrypted KEY '{}';
-             SELECT sqlcipher_export('encrypted');
-             DETACH DATABASE encrypted;",
-            encrypted_path, encryption_key
+            "ATTACH DATABASE '{}' AS encrypted;",
+            encrypted_path
         ))?;
+        conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
+        conn.execute_batch(
+            "SELECT sqlcipher_export('encrypted');
+             DETACH DATABASE encrypted;",
+        )?;
         Ok(())
     }
 
@@ -409,8 +457,17 @@ impl Storage {
         if trimmed.is_empty() {
             return self.get_recent_entries(limit);
         }
-        let sanitized = trimmed.replace('*', "");
+        // FTS5 サニタイズ 3 段:
+        // 1) `*` `^` `+` は phrase 内でも FTS5 構文として解釈されうるので除去
+        let sanitized: String = trimmed
+            .chars()
+            .filter(|c| !matches!(c, '*' | '^' | '+'))
+            .collect();
+        // 2) ダブルクォートは phrase 区切りなのでエスケープ
         let escaped = sanitized.replace('"', "\"\"");
+        // 3) boolean 演算子 (AND / OR / NOT / NEAR) を単語単位で除去
+        let escaped = Self::remove_fts5_operators(&escaped);
+        let escaped = escaped.trim();
         if escaped.is_empty() {
             return self.get_recent_entries(limit);
         }
@@ -1033,5 +1090,133 @@ mod tests {
 
         let results = storage.search_entries("NEEDLE_AT_END", 10).unwrap();
         assert!(results.is_empty(), "preview 外の文字列は FTS で見つからない");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // FTS5 サニタイズ / migrate_to_encrypted バリデーション (#2, #3)
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_search_sanitizes_fts5_operators() {
+        // AND / OR / NOT / NEAR がユーザ入力に混ざっていても FTS5 構文として
+        // 解釈されず、単なる語として扱われて 0 件で通ることを検証する。
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "hello world", "App").unwrap();
+        // "AND" 単独ワードは除去され、実クエリは空になって fallback で全件返却される。
+        let results = storage.search_entries("AND", 10).unwrap();
+        assert_eq!(results.len(), 1, "AND のみのクエリは全件 fallback になる");
+    }
+
+    #[test]
+    fn test_search_sanitizes_near_operator() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "cat sat mat", "App").unwrap();
+        // "NEAR" は除去されて "cat sat" (隣接) になり phrase match が成立する。
+        let results = storage.search_entries("cat NEAR sat", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_sanitizes_not_operator() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "keep me", "App").unwrap();
+        // "NOT keep" が生の FTS5 構文で通ると意図しない除外が起きる。除去された結果 "keep" が残る。
+        let results = storage.search_entries("NOT keep", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_sanitizes_special_chars() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "prefix content", "App").unwrap();
+        // `*` `^` `+` を混ぜても FTS5 構文エラーにならない。
+        let results = storage.search_entries("prefix*^+", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_operator_words_are_not_partial_match() {
+        // "android" のような単語の中に "and" があっても除去されないこと (完全一致でのみ弾く)。
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "android notable", "App").unwrap();
+        let results = storage.search_entries("android", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_fts5_operators_isolates_whole_words() {
+        assert_eq!(Storage::remove_fts5_operators("foo AND bar"), "foo bar");
+        assert_eq!(Storage::remove_fts5_operators("android"), "android"); // 部分一致は残す
+        assert_eq!(Storage::remove_fts5_operators("Or OR or"), ""); // 大文字小文字混在でも
+        assert_eq!(Storage::remove_fts5_operators("NEAR NEAR"), "");
+    }
+
+    #[test]
+    fn test_migrate_rejects_single_quote_in_path() {
+        let err = Storage::migrate_to_encrypted("/tmp/'evil.db", "/tmp/out.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_semicolon_in_path() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/x;DROP.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_special_chars_in_key() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b.db", "abc'; DROP--").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_special_chars_in_plain_path() {
+        let err = Storage::migrate_to_encrypted("/tmp/a$.db", "/tmp/b.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_plain_path() {
+        let err = Storage::migrate_to_encrypted("", "/tmp/b.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_encrypted_path() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_key() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b.db", "").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_accepts_valid_path_and_key() {
+        // 実 DB 生成でエンドツーエンドに通ること。
+        let dir = std::env::temp_dir().join("cb_test_migrate_accepts_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        let encrypted = dir.join("encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "secret", "App").unwrap();
+        }
+        Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .expect("migration should succeed with valid inputs");
+        // 暗号化された DB を鍵付きで開けて、内容が読めることを確認
+        let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text_content.as_deref(), Some("secret"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
