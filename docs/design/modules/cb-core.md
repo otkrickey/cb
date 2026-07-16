@@ -202,7 +202,8 @@ DBファイル: `~/Library/Application Support/CB/clipboard.db`
 
 | ファイル | テスト数 | 対象 |
 |----------|----------|------|
-| `crates/cb-core/src/storage.rs` | 58個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E) |
+| `crates/cb-core/src/storage.rs` | 51個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E) |
+| `crates/cb-core/src/blob_store.rs` | 7個 | blob 書き込み・読み出し・存在チェック・dedup・GC・削除 |
 
 ### 重要なテストケース
 
@@ -224,11 +225,21 @@ DBファイル: `~/Library/Application Support/CB/clipboard.db`
 **暗号化異常系**（`test_encrypted_db_wrong_key_fails`）:
 - 間違った暗号化キーでのDB読み出しが失敗する
 
-**マイグレーション**（`test_migrate_to_encrypted`）:
-- `sqlcipher_export`による平文→暗号化DB変換が正しく動作する
+**マイグレーション**（`test_migrate_to_encrypted` / `test_migrate_accepts_valid_path_and_key`）:
+- `sqlcipher_export`による平文→暗号化DB変換が正しく動作する。ホワイトリスト検証済のパス・鍵で E2E に成功する
+
+**マイグレーション異常系**（`test_migrate_rejects_single_quote_in_path` / `test_migrate_rejects_semicolon_in_path` / `test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_special_chars_in_plain_path` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}`）:
+- `'` / `;` / `$` 等の非許可文字を含むパス・鍵、および空文字を `InvalidParameterName` で拒否する
 
 **FTS5検索**（`test_search_entries_basic` / `test_search_entries_prefix_match` / `test_search_entries_empty_query_fallback` / `test_search_entries_delete_sync`）:
 - 基本的な全文検索、前方一致（`query*`）、空クエリのフォールバック、DELETE後のFTS同期
+
+**FTS5サニタイズ**（`test_search_special_chars_do_not_break_query` / `test_search_double_quotes_are_escaped` / `test_search_finds_text_containing_{and,or,not,near}`）:
+- `*` `^` `+` 混在クエリ・ダブルクォート混在クエリで FTS5 構文エラーにならない
+- "salt and pepper" / "cash or credit" / "do not disturb" / "walk near park" のように boolean 演算子相当の英単語を含む実データが、自己再検索でヒットする (回帰防止)
+
+**blob 外部化**（`test_large_text_externalized_to_blob` / `test_small_text_stays_inline` / `test_blob_dedup_between_entries` / `test_cleanup_gc_removes_orphan_blobs` / `test_missing_blob_falls_back_to_preview` / `test_utf8_prefix_respects_char_boundary` / `test_image_always_externalized` / `test_search_ignores_full_text_beyond_preview`）:
+- 閾値超過時のみ blob 化、小サイズは inline 維持、SHA-256 dedup、GC、blob 欠損時の preview fallback、UTF-8 境界での安全な切り詰め、preview 外文字列は FTS で検索不可
 
 **クリーンアップ**（`test_cleanup_old_entries` / `test_cleanup_preserves_recent` / `test_cleanup_empty_db`）:
 - 古いエントリの削除、最近のエントリの保持、空DBでの安全な動作
