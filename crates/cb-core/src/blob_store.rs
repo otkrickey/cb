@@ -84,14 +84,17 @@ impl BlobStore {
     }
 
     /// `referenced` に含まれない blob（孤児）を削除し、削除した SHA-256 を返す。
+    ///
+    /// blob 数 * 参照数 の線形探索を避け、`referenced` を HashSet に載せてから
+    /// 判定する (PR #17 review 指摘)。
     pub fn gc_orphans(&self, referenced: &[String]) -> io::Result<Vec<String>> {
+        let referenced: std::collections::HashSet<&str> =
+            referenced.iter().map(|s| s.as_str()).collect();
         let all = self.list_all()?;
         let mut removed = Vec::new();
         for sha in all {
-            if !referenced.iter().any(|r| r == &sha) {
-                if self.delete(&sha)? {
-                    removed.push(sha);
-                }
+            if !referenced.contains(sha.as_str()) && self.delete(&sha)? {
+                removed.push(sha);
             }
         }
         Ok(removed)

@@ -46,7 +46,7 @@ Rustで実装されたコアライブラリ。データモデル定義、SQLite�
 | `ClipboardMonitor`（Swift） | 新 FFI `save_clipboard_text_v2()` / `save_clipboard_blob_ref()` で保存。`blob_dir_path()` で blob 保管先を取得。旧 FFI (`save_clipboard_entry` / `save_clipboard_image`) は BC 用途で残置 |
 | `HistoryViewModel`（Swift） | `get_recent_entries()` / `search_entries()` / `get_entries_before()` / `delete_entry()` で取得・検索・削除 |
 | `HistoryWindowController`（Swift） | `touch_entry()` でペースト時にコピー回数更新 |
-| `PasteService`（Swift） | `get_entry_text()` / `get_entry_image()` でフル本文/画像取得。`is_blob_missing()` で外部化エントリの blob 欠損チェック |
+| `PasteService`（Swift） | `get_entry_text()` / `get_entry_image()` / `is_blob_missing()` でフル本文/画像取得 (Task.detached でバックグラウンド実行、blob 欠損時は preview へ fallback) |
 
 ---
 
@@ -60,15 +60,15 @@ Rustで実装されたコアライブラリ。データモデル定義、SQLite�
 | `migrate_database` | `fn(plain_path: String, encrypted_path: String, encryption_key: String) -> bool` | 平文DB→暗号化DBマイグレーション |
 | `save_clipboard_entry` | `fn(content_type: String, text: String, source_app: String) -> bool` | (旧FFI) テキスト系エントリ保存。Rust 側で閾値判定して自動 externalize |
 | `save_clipboard_image` | `fn(image_data: &[u8], source_app: String) -> bool` | (旧FFI) 画像エントリ保存 |
-| `save_clipboard_text_v2` | `fn(content_type: String, preview: String, text_content_or_empty: String, blob_sha256_or_empty: String, byte_size: i64, source_app: String) -> bool` | (新FFI) Swift 側で外部化判断・sha256 計算済のテキスト保存。inline は `text_content_or_empty`、外部化は `blob_sha256_or_empty` に |
+| `save_clipboard_text_v2` | `fn(content_type: String, preview: String, text_content_or_empty: String, blob_sha256_or_empty: String, byte_size: i64, source_app: String) -> bool` | (新FFI) Swift 側で外部化判断・sha256 計算済のテキスト保存。inline は `text_content_or_empty` に、外部化は `blob_sha256_or_empty` に |
 | `save_clipboard_blob_ref` | `fn(content_type: String, preview: String, blob_sha256: String, byte_size: i64, source_app: String) -> bool` | (新FFI) Swift 側で blob ファイルを書き終えた大サイズエントリの参照だけを DB に登録 |
 | `get_recent_entries` | `fn(limit: i32) -> String` | 最新N件をJSONラッパー `{"ok": [...]}` で返却。エラー時は `{"error": "..."}` |
 | `delete_entry` | `fn(id: i64) -> bool` | ID指定で削除 |
-| `get_entry_text` | `fn(id: i64) -> Option<String>` | テキスト内容取得。外部化エントリは blob から読み出す (失敗時は preview へ fallback) |
+| `get_entry_text` | `fn(id: i64) -> Option<String>` | テキスト内容取得。外部化エントリは blob から読み出す。失敗時は preview へ fallback |
 | `get_entry_image` | `fn(id: i64) -> Option<Vec<u8>>` | 画像バイト列取得。外部化エントリは blob から読み出す |
 | `get_entry_blob_sha256` | `fn(id: i64) -> Option<String>` | 外部化エントリの blob SHA-256 を返却 (inline エントリは `None`) |
 | `is_blob_missing` | `fn(id: i64) -> bool` | 外部化エントリの blob ファイルが実在しないか (整合性チェック用) |
-| `blob_dir_path` | `fn() -> String` | blob 保管ディレクトリの絶対パス |
+| `blob_dir_path` | `fn() -> Option<String>` | blob 保管ディレクトリの絶対パス。Storage 未初期化 / lock poisoning 時は `None`。Swift 側は必ず nil ガードすること (JSON エラー文字列を silent に返していた旧実装は廃止) |
 | `search_entries` | `fn(query: String, limit: i32) -> String` | FTS5全文検索（前方一致）。JSONラッパー形式 |
 | `get_entries_before` | `fn(before_timestamp: i64, limit: i32) -> String` | カーソルベースページネーション（ミリ秒タイムスタンプ）。JSONラッパー形式 |
 | `touch_entry` | `fn(id: i64) -> bool` | `created_at`を現在時刻に更新 + `copy_count`をインクリメント |
@@ -90,8 +90,8 @@ pub struct ClipboardEntry {
     pub content_type: ContentType,
     pub text_preview: Option<String>,     // 先頭 PREVIEW_BYTES (8KB) の UTF-8 抜粋 (FTS5 索引対象)
     pub text_content: Option<String>,     // 閾値未満のフルテキスト (外部化時は None)
-    pub blob_sha256: Option<String>,      // 外部化時のみ設定される blob 参照
-    pub byte_size: i64,                   // フル本文/画像のバイト数
+    pub blob_sha256: Option<String>,      // 外部化時のみ設定される blob 参照 (sha256 名)
+    pub byte_size: i64,                   // フル本文/画像のバイト数 (外部化前と外部化後で同一)
     #[serde(skip)]
     pub image_data: Option<Vec<u8>>,      // 常に外部化されるので JSON からも除外
     pub source_app: Option<String>,

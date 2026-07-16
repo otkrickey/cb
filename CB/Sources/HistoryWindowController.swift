@@ -79,20 +79,20 @@ class HistoryWindowController {
         guard index >= 0, index < entries.count else { return }
         let entry = entries[index]
 
+        // PasteService はバックグラウンドで blob 読み込みを行うので imageData を
+        // ここで prefetch する必要はない (以前は MainActor で FFI を叩いていた)。
         let _ = touch_entry(entry.id)
-        let imageData = entry.isImage ? viewModel.loadImageData(for: entry.id) : nil
-        PasteService.copyToClipboard(entry: entry, imageData: imageData, monitor: monitor, asPlainText: asPlainText)
         hide()
-
-        if let app = previousApp {
-            logger.notice("Activating previous app: \(app.localizedName ?? "unknown")")
-            app.activate()
-            Task { @MainActor in
+        Task { @MainActor in
+            await PasteService.copyToClipboard(entry: entry, monitor: monitor, asPlainText: asPlainText)
+            if let app = previousApp {
+                logger.notice("Activating previous app: \(app.localizedName ?? "unknown")")
+                app.activate()
                 try? await Task.sleep(for: .milliseconds(200))
                 PasteService.simulatePaste()
+            } else {
+                logger.warning("previousApp is nil, cannot paste")
             }
-        } else {
-            logger.warning("previousApp is nil, cannot paste")
         }
     }
 
@@ -120,12 +120,11 @@ class HistoryWindowController {
         ) { [weak self] entry in
             guard let self else { return }
             let _ = touch_entry(entry.id)
-            let imageData = entry.isImage ? self.viewModel.loadImageData(for: entry.id) : nil
-            PasteService.copyToClipboard(entry: entry, imageData: imageData, monitor: self.monitor)
             self.hide()
-            if let app = self.previousApp {
-                app.activate()
-                Task { @MainActor in
+            Task { @MainActor in
+                await PasteService.copyToClipboard(entry: entry, monitor: self.monitor)
+                if let app = self.previousApp {
+                    app.activate()
                     try? await Task.sleep(for: .milliseconds(200))
                     PasteService.simulatePaste()
                 }

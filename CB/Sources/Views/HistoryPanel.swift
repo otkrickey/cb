@@ -236,11 +236,12 @@ struct HistoryPanel: View {
                     Divider().padding(.leading, 16)
                 }
                 infoRow(label: "Content type", value: entry.displayType)
-                if let text = entry.textContent {
+                if entry.characterCount > 0 {
+                    let prefix = entry.countIsApproximate ? "≈" : ""
                     Divider().padding(.leading, 16)
-                    infoRow(label: "Characters", value: "\(text.count)")
+                    infoRow(label: "Characters", value: "\(prefix)\(entry.characterCount)")
                     Divider().padding(.leading, 16)
-                    infoRow(label: "Words", value: "\(entry.wordCount)")
+                    infoRow(label: "Words", value: "\(prefix)\(entry.wordCount)")
                 }
                 if let size = entry.formattedByteSize {
                     Divider().padding(.leading, 16)

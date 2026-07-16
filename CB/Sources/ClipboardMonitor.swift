@@ -20,8 +20,14 @@ class ClipboardMonitor: ObservableObject {
     private var lastChangeCount: Int = 0
     private var lastContentSha: String = ""
     private var isChecking = false
-    private lazy var blobDir: URL = {
-        let path = blob_dir_path().toString()
+    // Storage 未初期化状態で参照されると nil。呼び出し側は blobDir?.appendingPathComponent
+    // 等でガードする。以前は blob_dir_path() が JSON エラー文字列を返してもそれを
+    // 実在パスとして扱ってしまう silent failure だった (PR #17 review 指摘)。
+    private lazy var blobDir: URL? = {
+        guard let path = blob_dir_path()?.toString(), !path.isEmpty else {
+            logger.error("blob_dir_path returned nil (Storage not initialized)")
+            return nil
+        }
         let url = URL(fileURLWithPath: path)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
@@ -89,7 +95,10 @@ class ClipboardMonitor: ObservableObject {
         if isLarge {
             // 大きなテキストはフル String 化せず Data のまま blob に書き出す。
             // FFI に渡すのは preview (8KB) + sha256 のみ。
-            let blobDir = self.blobDir
+            guard let blobDir = self.blobDir else {
+                logger.error("blobDir unavailable; cannot externalize large text (bytes=\(byteSize))")
+                return
+            }
             let ok = await Task.detached {
                 writeBlob(dir: blobDir, sha: sha, data: data)
                 return save_clipboard_blob_ref("PlainText", preview, sha, Int64(byteSize), sourceApp)
@@ -113,7 +122,10 @@ class ClipboardMonitor: ObservableObject {
         guard sha != lastContentSha else { return }
         lastContentSha = sha
 
-        let blobDir = self.blobDir
+        guard let blobDir = self.blobDir else {
+            logger.error("blobDir unavailable; cannot externalize image (bytes=\(byteSize))")
+            return
+        }
         let ok = await Task.detached {
             writeBlob(dir: blobDir, sha: sha, data: data)
             return save_clipboard_blob_ref("Image", "", sha, Int64(byteSize), sourceApp)

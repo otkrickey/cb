@@ -163,9 +163,24 @@ impl Storage {
         Ok(false)
     }
 
-    /// FTS5 を text_preview 索引でリセットする。既存の FTS があれば破棄。
+    /// FTS5 スキーマのバージョン。旧 (text_content 索引) からのマイグレーションが済んで
+    /// text_preview 索引になっていれば FTS_SCHEMA_VERSION と一致する。
+    const FTS_SCHEMA_VERSION: i32 = 2;
+
+    /// FTS5 を text_preview 索引で構築する。
+    ///
+    /// PRAGMA user_version で「text_preview 索引に移行済みか」を判定し、
+    /// 既に移行済みならスキップする。以前は init_schema() のたびに無条件で
+    /// DROP + rebuild していたので、大規模履歴のユーザは毎起動で全件再構築の
+    /// コストを踏んでいた (PR #17 review 指摘)。
     fn rebuild_fts(&self) -> StorageResult<()> {
-        // 既存トリガー/仮想テーブルをまず削除
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version >= Self::FTS_SCHEMA_VERSION {
+            return Ok(());
+        }
+        // 既存トリガー/仮想テーブルをまず削除 (旧スキーマの text_content 索引を廃棄)
         self.conn.execute_batch(
             "DROP TRIGGER IF EXISTS clipboard_entries_ai;
              DROP TRIGGER IF EXISTS clipboard_entries_ad;
@@ -189,8 +204,10 @@ impl Storage {
                  VALUES ('delete', old.id, old.text_preview);
              END;
 
-             INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');"
+             INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');",
         )?;
+        self.conn
+            .pragma_update(None, "user_version", Self::FTS_SCHEMA_VERSION)?;
         Ok(())
     }
 

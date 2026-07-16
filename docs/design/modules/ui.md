@@ -90,17 +90,30 @@ SwiftUIビュー、ViewModel、ウィンドウ管理、入力ハンドリング�
 | `checkClipboard()` | changeCount比較 → 型判定 → `Task.detached`でRust FFI保存（メインスレッド非ブロック） |
 
 **コンテンツ型判定ロジック**:
-- `NSPasteboard.string(forType: .string)` → テキスト取得
-  - 前後空白をトリミング → `/`または`~`始まり（チルダ展開対応）、かつ単一行、かつファイルまたは親ディレクトリが`FileManager.fileExists`で存在確認 → `FilePath`
+- `NSPasteboard.data(forType: .string)` → `Data`取得
+  - UTF-8 デコードして単一行かつパスっぽいパターン (先頭 `/` or `~`、かつファイルまたは親ディレクトリが存在) → `FilePath`
   - それ以外 → `PlainText`
-- `.tiff`または`.png`データ → `Image`
-- コンテンツハッシュで重複をスキップ
+- `.tiff`または`.png` → `Image`（バイト列は `Data`）
+- **重複スキップ**: SHA-256 で `lastContentSha` と比較。以前は `String.hashValue` を使っていたが、衝突可能性・プロセス間非決定性があったため sha256 化 (PR #18)
+
+**blob 外部化 (PR #17/#18)**:
+
+- テキスト:
+  - サイズ (`byteSize`) が `TEXT_EXTERNALIZE_THRESHOLD_BYTES` (256KB) を超える → 大サイズ扱い。
+    フル `String` 化せず `Data` のまま `<blobDir>/<sha256>.bin` に書き出し、
+    FFI は `save_clipboard_blob_ref(...)` に preview (8KB) + sha256 + サイズだけ渡す
+  - 閾値以下 → UTF-8 デコードして `save_clipboard_text_v2(...)` に inline テキストと preview を渡す
+- 画像は常に blob 化 (`save_clipboard_blob_ref("Image", "", sha, size, sourceApp)`)
+- `blobDir` は `blob_dir_path()` FFI から取得。**未初期化時は `nil` が返るため必ずガードすること**
+  (以前は JSON エラー文字列を返して silent failure だった)
+- Swift 側の閾値定数 `TEXT_EXTERNALIZE_THRESHOLD_BYTES` / `PREVIEW_BYTES_LIMIT` は
+  Rust 側 (`storage.rs` / `models.rs`) と手動同期。値がズレると外部化判断が食い違う
 
 **監視開始**: `init()`内で`startMonitoring()`を自動呼び出し（AppDelegateでの明示呼び出し不要）
 
 **解放**: `deinit`で`MainActor.assumeIsolated { timer?.invalidate() }`によりタイマーを安全に停止
 
-**FFI保存のバックグラウンド実行**: `save_clipboard_entry` / `save_clipboard_image` は `Task.detached` でバックグラウンドスレッドから呼び出す。メインスレッドでのMutexロック取得によるUIフリーズを防止
+**FFI保存のバックグラウンド実行**: `save_clipboard_*` / sha256 計算 / blob 書き込みはすべて `Task.detached` でバックグラウンドスレッドから呼び出す。メインスレッドでのMutexロック取得・ディスク I/O によるUIフリーズを防止
 
 ### HistoryWindowController（`HistoryWindowController.swift`）
 
@@ -137,8 +150,10 @@ Carbon Event Manager による⌥⌘V グローバルホットキー登録。Use
 
 | メソッド | 説明 |
 |---------|------|
-| `copyToClipboard(entry, imageData, monitor, asPlainText)` | NSPasteboardにコンテンツ設定。`asPlainText=true`時はテキストのみ`.string`型で設定。`monitor.skipNextChange = true`でセルフループ防止 |
+| `async copyToClipboard(entry, imageData?, monitor, asPlainText)` | エントリを NSPasteboard に載せる。**外部化された blob の読み込み (`get_entry_text` / `get_entry_image`) は `Task.detached` でバックグラウンド実行してから MainActor に戻って `pasteboard.setString` / `writeObjects` を呼ぶ**。これにより MainActor 上の同期ディスク I/O によるフリーズを回避 (PR #18 review 対応)。`imageData?` は呼び出し側で既にロード済みなら渡す (省略時はバックグラウンドで自動ロード) |
 | `simulatePaste()` | `AXIsProcessTrusted()`確認 → CGEventで⌘+Vキーストロークをシミュレート |
+
+呼び出し側は必ず `Task { await PasteService.copyToClipboard(...) }` の形で呼ぶこと。`hide()` はペーストボード反映を待たず即実行可能 (`skipNextChange` フラグが同期的にセットされる)。
 
 ### HistoryViewModel（`HistoryViewModel.swift`）
 

@@ -34,8 +34,8 @@ public func get_entry_blob_sha256(_ id: Int64) -> Optional<RustString> {
 public func is_blob_missing(_ id: Int64) -> Bool {
     __swift_bridge__$is_blob_missing(id)
 }
-public func blob_dir_path() -> RustString {
-    RustString(ptr: __swift_bridge__$blob_dir_path())
+public func blob_dir_path() -> Optional<RustString> {
+    { let val = __swift_bridge__$blob_dir_path(); if val != nil { return RustString(ptr: val!) } else { return nil } }()
 }
 public func search_entries<GenericIntoRustString: IntoRustString>(_ query: GenericIntoRustString, _ limit: Int32) -> RustString {
     RustString(ptr: __swift_bridge__$search_entries({ let rustString = query.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), limit))

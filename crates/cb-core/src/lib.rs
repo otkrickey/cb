@@ -56,7 +56,7 @@ mod ffi {
         fn get_entry_image(id: i64) -> Option<Vec<u8>>;
         fn get_entry_blob_sha256(id: i64) -> Option<String>;
         fn is_blob_missing(id: i64) -> bool;
-        fn blob_dir_path() -> String;
+        fn blob_dir_path() -> Option<String>;
         fn search_entries(query: String, limit: i32) -> String;
         fn get_entries_before(before_timestamp: i64, limit: i32) -> String;
         fn touch_entry(id: i64) -> bool;
@@ -187,8 +187,14 @@ fn is_blob_missing(id: i64) -> bool {
     })
 }
 
-fn blob_dir_path() -> String {
-    with_storage_str(|storage| storage.blob_store().root().to_string_lossy().to_string())
+/// blob 保管ディレクトリの絶対パスを返す。
+///
+/// Storage 未初期化時 / lock poisoning 時は `None` を返す。以前は
+/// `with_storage_str` を流用しており `{"error":"..."}` という JSON 文字列を
+/// パスとして返してしまい、呼び出し側が実在しないディレクトリを掴んで
+/// サイレント失敗する不具合があった (PR #17 review 指摘)。
+fn blob_dir_path() -> Option<String> {
+    with_storage_opt(|storage| Some(storage.blob_store().root().to_string_lossy().to_string()))
 }
 
 fn search_entries(query: String, limit: i32) -> String {

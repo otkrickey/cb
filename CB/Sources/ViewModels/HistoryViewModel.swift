@@ -103,7 +103,9 @@ struct ClipboardEntryModel: Identifiable, Codable {
         guard size > 0 else { return nil }
         let bcf = ByteCountFormatter()
         bcf.countStyle = .file
-        bcf.allowedUnits = [.useKB, .useMB, .useGB]
+        // 1KB 未満のエントリでも「1 KB」等に丸められないよう .useBytes を含める
+        // (PR #18 review 指摘)
+        bcf.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
         return bcf.string(fromByteCount: size)
     }
 
@@ -122,12 +124,19 @@ struct ClipboardEntryModel: Identifiable, Codable {
         }
     }
 
+    /// Characters/Words/Lines は外部化エントリでは text_content が nil のため
+    /// text_preview へ fallback する (previewText と同じ挙動)。fallback 時は
+    /// preview 範囲 (8KB) 内での近似値となる。
+    private var countableText: String? {
+        text_content ?? text_preview
+    }
+
     var characterCount: Int {
-        text_content?.count ?? 0
+        countableText?.count ?? 0
     }
 
     var wordCount: Int {
-        guard let text = text_content else { return 0 }
+        guard let text = countableText else { return 0 }
         var count = 0
         text.enumerateSubstrings(in: text.startIndex..., options: [.byWords, .substringNotRequired]) { _, _, _, _ in
             count += 1
@@ -136,7 +145,13 @@ struct ClipboardEntryModel: Identifiable, Codable {
     }
 
     var lineCount: Int {
-        text_content?.components(separatedBy: .newlines).count ?? 0
+        countableText?.components(separatedBy: .newlines).count ?? 0
+    }
+
+    /// Characters/Words 表示が preview からの近似値かどうか。
+    /// UI 側は true のとき「≈」等の目印を付けると良い。
+    var countIsApproximate: Bool {
+        text_content == nil && text_preview != nil
     }
 
     var formattedDate: String {
