@@ -57,6 +57,10 @@ impl Storage {
     ) -> StorageResult<Self> {
         let conn = Connection::open(db_path)?;
         if let Some(key) = encryption_key {
+            // migrate_to_encrypted と同じホワイトリストで検証し、
+            // Storage::new と migrate_to_encrypted の間で受理条件を揃える。
+            // (PR #15 review 指摘: 同じ鍵が片方で通り片方で弾かれる非対称の解消)
+            Self::validate_encryption_key(key)?;
             conn.pragma_update(None, "key", key)?;
         }
         let blob_store = BlobStore::new(blob_dir)?;
