@@ -1434,4 +1434,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_rebuild_fts_skipped_after_migration() {
+        // 初回 Storage::new で user_version=2 がセットされ、
+        // 2 回目以降の open では rebuild_fts が早期 return してテーブルが
+        // 破棄・再作成されないことを検証する (PR #17 review Medium 指摘)。
+        let dir = std::env::temp_dir().join("cb_test_rebuild_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+
+        // 1 回目 open
+        {
+            let s = Storage::new(db_path.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "marker payload", "App").unwrap();
+            // user_version が 2 になっているはず
+            let v: i32 = s.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(v, Storage::FTS_SCHEMA_VERSION);
+        }
+
+        // 2 回目 open — rebuild_fts はスキップされる。FTS テーブルが drop されず
+        // 検索が続けて機能する = 前回 INSERT した内容がまだ引ける。
+        {
+            let s = Storage::new(db_path.to_str().unwrap(), None).unwrap();
+            let results = s.search_entries("marker", 10).unwrap();
+            assert_eq!(results.len(), 1, "rebuild スキップ後も FTS 索引は生き残る");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

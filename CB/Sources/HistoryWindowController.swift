@@ -81,11 +81,15 @@ class HistoryWindowController {
 
         // PasteService はバックグラウンドで blob 読み込みを行うので imageData を
         // ここで prefetch する必要はない (以前は MainActor で FFI を叩いていた)。
+        // previousApp は await 前にキャプチャする — hide() + copyToClipboard の
+        // 非同期完了までにフォーカスが移って上書きされる可能性があるため
+        // (PR #19 review 指摘)。
+        let capturedApp = previousApp
         let _ = touch_entry(entry.id)
         hide()
         Task { @MainActor in
             await PasteService.copyToClipboard(entry: entry, monitor: monitor, asPlainText: asPlainText)
-            if let app = previousApp {
+            if let app = capturedApp {
                 logger.notice("Activating previous app: \(app.localizedName ?? "unknown")")
                 app.activate()
                 try? await Task.sleep(for: .milliseconds(200))
@@ -119,11 +123,13 @@ class HistoryWindowController {
             selectionState: selectionState
         ) { [weak self] entry in
             guard let self else { return }
+            // previousApp は await 前にキャプチャ (同上の理由)。
+            let capturedApp = self.previousApp
             let _ = touch_entry(entry.id)
             self.hide()
             Task { @MainActor in
                 await PasteService.copyToClipboard(entry: entry, monitor: self.monitor)
-                if let app = self.previousApp {
+                if let app = capturedApp {
                     app.activate()
                     try? await Task.sleep(for: .milliseconds(200))
                     PasteService.simulatePaste()

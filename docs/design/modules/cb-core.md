@@ -163,13 +163,13 @@ static STORAGE: Mutex<Option<Storage>> = Mutex::new(None);
 CREATE TABLE IF NOT EXISTS clipboard_entries (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     content_type    TEXT NOT NULL,
-    text_preview    TEXT,                 -- 先頭 PREVIEW_BYTES (8KB) の UTF-8 抜粋 (FTS5 索引対象)
-    text_content    TEXT,                 -- 閾値未満のフルテキスト (外部化時は NULL)
-    image_data      BLOB,                 -- レガシー画像 inline (新規は blob_sha256 経由)
-    blob_sha256     TEXT,                 -- 外部化時のみ設定される blob 参照
+    text_preview    TEXT,                        -- 先頭 PREVIEW_BYTES (8KB) の UTF-8 抜粋 (FTS5 索引対象)
+    text_content    TEXT,                        -- 閾値未満のフルテキスト (外部化時は NULL)
+    image_data      BLOB,                        -- レガシー画像 inline (新規は blob_sha256 経由)
+    blob_sha256     TEXT,                        -- 外部化時のみ設定される blob 参照
     byte_size       INTEGER NOT NULL DEFAULT 0,  -- フル本文/画像のバイト数
     source_app      TEXT,
-    created_at      INTEGER NOT NULL,     -- ミリ秒単位のUnixタイムスタンプ
+    created_at      INTEGER NOT NULL,            -- ミリ秒単位のUnixタイムスタンプ
     copy_count      INTEGER NOT NULL DEFAULT 1,
     first_copied_at INTEGER NOT NULL DEFAULT 0
 );

@@ -124,7 +124,7 @@ SwiftUIビュー、ViewModel、ウィンドウ管理、入力ハンドリング�
 | `toggle()` | パネル非表示時は`show()`。表示中は`cycleTypeFilter()`でコンテンツタイプフィルタを切り替え（All → Text → Images → Files → All） |
 | `show()` | `previousApp`に前面アプリを記憶 → `typeFilter`リセット → エントリ読み込み → パネル表示 |
 | `hide()` | パネル非表示 |
-| `selectAndPaste(asPlainText:)` | `touch_entry(id)`でコピー回数更新 → 選択エントリをペースト → `hide()` → `previousApp`をactivate → 200ms後に`simulatePaste()` |
+| `selectAndPaste(asPlainText:)` | `previousApp`をキャプチャ → `touch_entry(id)`でコピー回数更新 → `hide()` → 非同期タスク内で `await PasteService.copyToClipboard(...)` (blob 読み込みをバックグラウンドで実行) → キャプチャした previousApp を activate → 200ms後に`simulatePaste()` |
 | `handleKey(NSEvent)` | ↑↓: 選択移動、Return: ペースト、Shift+Return: プレーンテキストペースト、Esc: 閉じる |
 
 **KeyablePanel**（`NSPanel`サブクラス）:
