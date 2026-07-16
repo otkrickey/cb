@@ -43,10 +43,10 @@ Rustで実装されたコアライブラリ。データモデル定義、SQLite�
 | 呼び出し元 | 用途 |
 |------------|------|
 | `AppDelegate`（Swift） | `init_storage()` でDB初期化、`migrate_database()` でマイグレーション、`cleanup_old_entries()` で起動時クリーンアップ |
-| `ClipboardMonitor`（Swift） | `save_clipboard_entry()` / `save_clipboard_image()` で保存 |
+| `ClipboardMonitor`（Swift） | 新 FFI `save_clipboard_text_v2()` / `save_clipboard_blob_ref()` で保存。`blob_dir_path()` で blob 保管先を取得。旧 FFI (`save_clipboard_entry` / `save_clipboard_image`) は BC 用途で残置 |
 | `HistoryViewModel`（Swift） | `get_recent_entries()` / `search_entries()` / `get_entries_before()` / `delete_entry()` で取得・検索・削除 |
 | `HistoryWindowController`（Swift） | `touch_entry()` でペースト時にコピー回数更新 |
-| `PasteService`（Swift） | `get_entry_text()` / `get_entry_image()` でデータ取得 |
+| `PasteService`（Swift） | `get_entry_text()` / `get_entry_image()` でフル本文/画像取得。`is_blob_missing()` で外部化エントリの blob 欠損チェック |
 
 ---
 
