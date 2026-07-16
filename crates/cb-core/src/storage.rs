@@ -1122,6 +1122,17 @@ mod tests {
     }
 
     #[test]
+    fn test_search_only_removed_chars_falls_back_to_recent() {
+        // 除去対象文字だけで構成されたクエリはサニタイズ後に空になり、
+        // get_recent_entries フォールバックで全件返る。
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "a", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "b", "App").unwrap();
+        let results = storage.search_entries("^+*^+", 10).unwrap();
+        assert_eq!(results.len(), 2, "全て除去対象なので empty query fallback で全件");
+    }
+
+    #[test]
     fn test_search_double_quotes_are_escaped() {
         // クエリ内の `"` を `""` にエスケープした上でフレーズ検索されること。
         // エスケープを忘れると `"foo"bar"` みたいなクエリでフレーズが早く閉じて

@@ -96,6 +96,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if fileManager.fileExists(atPath: plainPath) {
+            // 残骸 (前回の中断/クラッシュで作られた不完全な encrypted DB) が dbPath に
+            // 存在すると migrate_database (ATTACH → sqlcipher_export) が SQLCipher レベル
+            // で未定義動作になり、以降起動のたびにマイグレーションが再失敗し続ける。
+            // 呼び出し前にファイルを削除して cb-core 側の前提 (encrypted_path は存在しない)
+            // を満たす。
+            if fileManager.fileExists(atPath: dbPath) {
+                logger.warning("Removing stale encrypted DB residue at \(dbPath) before migration retry")
+                do {
+                    try fileManager.removeItem(atPath: dbPath)
+                } catch {
+                    logger.error("Failed to remove stale encrypted DB residue: \(error)")
+                    return
+                }
+            }
             let migrated = migrate_database(plainPath, dbPath, encryptionKey)
             if migrated {
                 logger.notice("Successfully migrated plain DB to encrypted DB")
