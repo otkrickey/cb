@@ -231,7 +231,7 @@ INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');
 
 | ファイル | テスト数 | 対象 |
 |----------|----------|------|
-| `crates/cb-core/src/storage.rs` | 53個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted (E2E/両パス記号許容/再実行/エスケープ/インジェクション防御) |
+| `crates/cb-core/src/storage.rs` | 56個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted (E2E/両パス記号許容/再実行/エスケープ/インジェクション防御) |
 | `crates/cb-core/src/blob_store.rs` | 7個 | blob 書き込み・読み出し・存在チェック・dedup・GC・削除 |
 
 ### 重要なテストケース

@@ -469,11 +469,21 @@ impl Storage {
             "ATTACH DATABASE '{}' AS encrypted;",
             escaped_encrypted
         ))?;
-        conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
-        conn.execute_batch(
-            "SELECT sqlcipher_export('encrypted');
-             DETACH DATABASE encrypted;",
-        )?;
+        // ATTACH は encrypted_path にファイルを作る。以降のステップで失敗した場合、
+        // 不完全なファイルが残ると次回起動時のリトライで別の障害要因になるので
+        // best-effort で削除する (PR #15 review Low 指摘)。
+        let result: Result<(), rusqlite::Error> = (|| {
+            conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
+            conn.execute_batch(
+                "SELECT sqlcipher_export('encrypted');
+                 DETACH DATABASE encrypted;",
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(encrypted_path);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1204,9 +1214,16 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_rejects_nul_in_path() {
+    fn test_migrate_rejects_nul_in_encrypted_path() {
         // NUL は C 文字列を切ってしまう silent truncation なので必ず拒否する。
         let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b\0evil.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_nul_in_plain_path() {
+        // plain_path 側の NUL 拒否も対称に担保する。
+        let err = Storage::migrate_to_encrypted("/tmp/a\0evil.db", "/tmp/b.db", "abcd").unwrap_err();
         assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
     }
 
