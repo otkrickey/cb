@@ -48,7 +48,10 @@ enum ContentTypeFilter: CaseIterable {
 struct ClipboardEntryModel: Identifiable, Codable {
     let id: Int64
     let content_type: String
+    let text_preview: String?
     let text_content: String?
+    let blob_sha256: String?
+    let byte_size: Int64?
     let source_app: String?
     let created_at: Int64
     let copy_count: Int64
@@ -56,6 +59,10 @@ struct ClipboardEntryModel: Identifiable, Codable {
 
     var contentType: String { content_type }
     var textContent: String? { text_content }
+    var textPreview: String? { text_preview }
+    var blobSha256: String? { blob_sha256 }
+    var byteSize: Int64 { byte_size ?? 0 }
+    var isExternalized: Bool { blob_sha256 != nil }
     var sourceApp: String? { source_app }
     var createdAt: Date { Date(timeIntervalSince1970: TimeInterval(created_at) / 1000.0) }
     var firstCopiedAt: Date { Date(timeIntervalSince1970: TimeInterval(first_copied_at) / 1000.0) }
@@ -64,11 +71,25 @@ struct ClipboardEntryModel: Identifiable, Codable {
     var isImage: Bool { content_type == "Image" }
     var isEmpty: Bool { id == -1 }
 
-    static let empty = ClipboardEntryModel(id: -1, content_type: "", text_content: nil, source_app: nil, created_at: 0, copy_count: 1, first_copied_at: 0)
+    static let empty = ClipboardEntryModel(
+        id: -1,
+        content_type: "",
+        text_preview: nil,
+        text_content: nil,
+        blob_sha256: nil,
+        byte_size: nil,
+        source_app: nil,
+        created_at: 0,
+        copy_count: 1,
+        first_copied_at: 0
+    )
 
     var previewText: String {
         if let text = text_content {
             return String(text.prefix(200))
+        }
+        if let preview = text_preview, !preview.isEmpty {
+            return String(preview.prefix(200))
         }
         if isImage {
             return "[Image]"

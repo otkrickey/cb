@@ -1,202 +1,294 @@
 use rusqlite::{Connection, params};
-use crate::models::{ClipboardEntry, ContentType};
+use std::path::{Path, PathBuf};
+use crate::blob_store::BlobStore;
+use crate::models::{ClipboardEntry, ContentType, PREVIEW_BYTES};
+
+/// テキストコンテンツを DB inline から外部 blob に切り替える閾値（バイト）。
+/// これを超えたら sha256 名で blob ファイルに書き出し、DB には参照のみ残す。
+///
+/// 変更しても既存データは壊れない: read パスは `blob_sha256 IS NOT NULL`
+/// でdispatchしており、サイズを見ないため。
+pub const TEXT_EXTERNALIZE_THRESHOLD_BYTES: usize = 262_144;
+
+#[derive(Debug)]
+pub enum StorageError {
+    Sqlite(rusqlite::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageError::Sqlite(e) => write!(f, "sqlite: {e}"),
+            StorageError::Io(e) => write!(f, "io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self { StorageError::Sqlite(e) }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(e: std::io::Error) -> Self { StorageError::Io(e) }
+}
+
+pub type StorageResult<T> = Result<T, StorageError>;
 
 pub struct Storage {
     conn: Connection,
+    blob_store: BlobStore,
 }
 
 impl Storage {
-    pub fn new(db_path: &str, encryption_key: Option<&str>) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(db_path)?;
+    /// 通常起動用。DB パス親ディレクトリの `blobs/` を blob 保管所として使う。
+    /// 例: db_path = `~/.../CB/clipboard.db` → blobs = `~/.../CB/blobs/`
+    pub fn new(db_path: &str, encryption_key: Option<&str>) -> StorageResult<Self> {
+        let blob_dir = default_blob_dir(Path::new(db_path));
+        Self::new_with_blob_dir(db_path, encryption_key, blob_dir)
+    }
 
+    pub fn new_with_blob_dir(
+        db_path: &str,
+        encryption_key: Option<&str>,
+        blob_dir: PathBuf,
+    ) -> StorageResult<Self> {
+        let conn = Connection::open(db_path)?;
         if let Some(key) = encryption_key {
             conn.pragma_update(None, "key", key)?;
         }
-
-        let storage = Storage { conn };
+        let blob_store = BlobStore::new(blob_dir)?;
+        let storage = Storage { conn, blob_store };
         storage.init_schema()?;
         Ok(storage)
     }
 
-    pub fn new_in_memory() -> Result<Self, rusqlite::Error> {
+    /// テスト用: DB は :memory:、blob は一意な一時ディレクトリに書き出す。
+    pub fn new_in_memory() -> StorageResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let storage = Storage { conn };
+        let blob_dir = tmp_blob_dir();
+        let blob_store = BlobStore::new(blob_dir)?;
+        let storage = Storage { conn, blob_store };
         storage.init_schema()?;
         Ok(storage)
     }
 
-    fn init_schema(&self) -> Result<(), rusqlite::Error> {
+    pub fn blob_store(&self) -> &BlobStore { &self.blob_store }
+
+    fn init_schema(&self) -> StorageResult<()> {
+        // 新規作成は最初から新スキーマで。既存 DB は下の migrate_* が拡張する。
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS clipboard_entries (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_type  TEXT NOT NULL,
-                text_content  TEXT,
-                image_data    BLOB,
-                source_app    TEXT,
-                created_at    INTEGER NOT NULL,
-                copy_count    INTEGER NOT NULL DEFAULT 1,
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_type    TEXT NOT NULL,
+                text_preview    TEXT,
+                text_content    TEXT,
+                image_data      BLOB,
+                blob_sha256     TEXT,
+                byte_size       INTEGER NOT NULL DEFAULT 0,
+                source_app      TEXT,
+                created_at      INTEGER NOT NULL,
+                copy_count      INTEGER NOT NULL DEFAULT 1,
                 first_copied_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_created_at
             ON clipboard_entries(created_at DESC);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_fts
-            USING fts5(text_content, content='clipboard_entries', content_rowid='id');
-
-            CREATE TRIGGER IF NOT EXISTS clipboard_entries_ai
-            AFTER INSERT ON clipboard_entries
-            BEGIN
-                INSERT INTO clipboard_fts(rowid, text_content)
-                VALUES (new.id, new.text_content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS clipboard_entries_ad
-            AFTER DELETE ON clipboard_entries
-            BEGIN
-                INSERT INTO clipboard_fts(clipboard_fts, rowid, text_content)
-                VALUES ('delete', old.id, old.text_content);
-            END;"
+            CREATE INDEX IF NOT EXISTS idx_blob_sha256
+            ON clipboard_entries(blob_sha256) WHERE blob_sha256 IS NOT NULL;"
         )?;
 
-        // Migrate existing tables: add copy_count and first_copied_at if missing
+        // 既存テーブルへのカラム追加（idempotent）
         self.migrate_add_columns()?;
 
-        // Migrate timestamps from seconds to milliseconds
+        // タイムスタンプ秒→ミリ秒
         self.conn.execute_batch(
             "UPDATE clipboard_entries SET created_at = created_at * 1000 WHERE created_at > 0 AND created_at < 10000000000;
              UPDATE clipboard_entries SET first_copied_at = first_copied_at * 1000 WHERE first_copied_at > 0 AND first_copied_at < 10000000000;"
         )?;
 
-        // Rebuild FTS index only if it's out of sync (e.g., after table creation with existing data)
-        let fts_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM clipboard_fts", [], |row| row.get(0)
-        ).unwrap_or(0);
-        let main_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM clipboard_entries WHERE text_content IS NOT NULL", [], |row| row.get(0)
-        ).unwrap_or(0);
-        if fts_count != main_count {
-            self.conn.execute_batch("INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');")?;
-        }
+        // FTS5 は text_preview を索引化する形に統一。旧 FTS(text_content 索引)は
+        // ここでリセットして作り直す。
+        self.rebuild_fts()?;
 
         Ok(())
     }
 
-    fn migrate_add_columns(&self) -> Result<(), rusqlite::Error> {
-        let has_copy_count: bool = self.conn
-            .prepare("SELECT copy_count FROM clipboard_entries LIMIT 0")
-            .is_ok();
-        if !has_copy_count {
-            self.conn.execute_batch(
-                "ALTER TABLE clipboard_entries ADD COLUMN copy_count INTEGER NOT NULL DEFAULT 1;"
-            )?;
+    fn migrate_add_columns(&self) -> StorageResult<()> {
+        for (col, ddl) in [
+            ("copy_count",      "ALTER TABLE clipboard_entries ADD COLUMN copy_count INTEGER NOT NULL DEFAULT 1"),
+            ("first_copied_at", "ALTER TABLE clipboard_entries ADD COLUMN first_copied_at INTEGER NOT NULL DEFAULT 0"),
+            ("text_preview",    "ALTER TABLE clipboard_entries ADD COLUMN text_preview TEXT"),
+            ("blob_sha256",     "ALTER TABLE clipboard_entries ADD COLUMN blob_sha256 TEXT"),
+            ("byte_size",       "ALTER TABLE clipboard_entries ADD COLUMN byte_size INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !self.column_exists("clipboard_entries", col)? {
+                self.conn.execute_batch(&format!("{ddl};"))?;
+            }
         }
 
-        let has_first_copied_at: bool = self.conn
-            .prepare("SELECT first_copied_at FROM clipboard_entries LIMIT 0")
-            .is_ok();
-        if !has_first_copied_at {
-            self.conn.execute_batch(
-                "ALTER TABLE clipboard_entries ADD COLUMN first_copied_at INTEGER NOT NULL DEFAULT 0;"
-            )?;
-            self.conn.execute_batch(
-                "UPDATE clipboard_entries SET first_copied_at = created_at WHERE first_copied_at = 0;"
-            )?;
-        }
+        // first_copied_at のバックフィル (旧 code そのまま踏襲)
+        self.conn.execute_batch(
+            "UPDATE clipboard_entries SET first_copied_at = created_at WHERE first_copied_at = 0;"
+        )?;
+
+        // text_preview / byte_size のバックフィル (未設定の行のみ)
+        let preview_limit = PREVIEW_BYTES as i64;
+        self.conn.execute(
+            "UPDATE clipboard_entries
+                SET text_preview = SUBSTR(text_content, 1, ?1)
+              WHERE text_preview IS NULL AND text_content IS NOT NULL",
+            params![preview_limit],
+        )?;
+        self.conn.execute_batch(
+            "UPDATE clipboard_entries
+                SET byte_size = COALESCE(LENGTH(text_content), LENGTH(image_data), 0)
+              WHERE byte_size = 0 AND (text_content IS NOT NULL OR image_data IS NOT NULL);"
+        )?;
+
         Ok(())
     }
 
+    fn column_exists(&self, table: &str, column: &str) -> StorageResult<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in rows {
+            if name? == column { return Ok(true); }
+        }
+        Ok(false)
+    }
+
+    /// FTS5 を text_preview 索引でリセットする。既存の FTS があれば破棄。
+    fn rebuild_fts(&self) -> StorageResult<()> {
+        // 既存トリガー/仮想テーブルをまず削除
+        self.conn.execute_batch(
+            "DROP TRIGGER IF EXISTS clipboard_entries_ai;
+             DROP TRIGGER IF EXISTS clipboard_entries_ad;
+             DROP TRIGGER IF EXISTS clipboard_entries_au;
+             DROP TABLE IF EXISTS clipboard_fts;
+
+             CREATE VIRTUAL TABLE clipboard_fts
+             USING fts5(text_preview, content='clipboard_entries', content_rowid='id');
+
+             CREATE TRIGGER clipboard_entries_ai
+             AFTER INSERT ON clipboard_entries
+             BEGIN
+                 INSERT INTO clipboard_fts(rowid, text_preview)
+                 VALUES (new.id, new.text_preview);
+             END;
+
+             CREATE TRIGGER clipboard_entries_ad
+             AFTER DELETE ON clipboard_entries
+             BEGIN
+                 INSERT INTO clipboard_fts(clipboard_fts, rowid, text_preview)
+                 VALUES ('delete', old.id, old.text_preview);
+             END;
+
+             INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');"
+        )?;
+        Ok(())
+    }
+
+    /// テキストエントリを保存する。閾値を超えるフルテキストは外部 blob に切り出す。
     pub fn insert_text_entry(
         &self,
         content_type: &ContentType,
         text: &str,
         source_app: &str,
-    ) -> Result<i64, rusqlite::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime before UNIX_EPOCH")
-            .as_millis() as i64;
-
-        self.conn.execute(
-            "INSERT INTO clipboard_entries (content_type, text_content, source_app, created_at, copy_count, first_copied_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?4)",
-            params![content_type.as_str(), text, source_app, now],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+    ) -> StorageResult<i64> {
+        let byte_size = text.len() as i64;
+        let preview = utf8_prefix(text, PREVIEW_BYTES);
+        let (text_content, blob_sha256) = if text.len() > TEXT_EXTERNALIZE_THRESHOLD_BYTES {
+            let sha = self.blob_store.write(text.as_bytes())?;
+            (None, Some(sha))
+        } else {
+            (Some(text.to_string()), None)
+        };
+        self.insert_prepared_text(content_type, Some(&preview), text_content.as_deref(), blob_sha256.as_deref(), byte_size, source_app)
     }
 
+    /// 画像エントリを保存する。画像は常に外部 blob に置く（DB inline せず）。
     pub fn insert_image_entry(
         &self,
         image_data: &[u8],
         source_app: &str,
-    ) -> Result<i64, rusqlite::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime before UNIX_EPOCH")
-            .as_millis() as i64;
+    ) -> StorageResult<i64> {
+        let byte_size = image_data.len() as i64;
+        let sha = self.blob_store.write(image_data)?;
+        self.insert_prepared_text(&ContentType::Image, None, None, Some(&sha), byte_size, source_app)
+    }
 
+    /// 事前に外部準備された preview / full / blob_sha256 / byte_size を DB に書き込む低レイヤ。
+    /// Swift 側で SHA-256 と preview を先に計算してからここに直接送ってくる用途。
+    ///
+    /// content_type != Image のときは text_preview を必ず与えること（FTS 対象）。
+    pub fn insert_prepared_text(
+        &self,
+        content_type: &ContentType,
+        text_preview: Option<&str>,
+        text_content: Option<&str>,
+        blob_sha256: Option<&str>,
+        byte_size: i64,
+        source_app: &str,
+    ) -> StorageResult<i64> {
+        let now = now_millis();
         self.conn.execute(
-            "INSERT INTO clipboard_entries (content_type, image_data, source_app, created_at, copy_count, first_copied_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?4)",
-            params![ContentType::Image.as_str(), image_data, source_app, now],
+            "INSERT INTO clipboard_entries
+               (content_type, text_preview, text_content, blob_sha256, byte_size, source_app, created_at, copy_count, first_copied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?7)",
+            params![
+                content_type.as_str(),
+                text_preview,
+                text_content,
+                blob_sha256,
+                byte_size,
+                source_app,
+                now,
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn get_recent_entries(&self, limit: i32) -> Result<Vec<ClipboardEntry>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content_type, text_content, source_app, created_at, copy_count, first_copied_at
-             FROM clipboard_entries
+    /// Swift 側が既に blob をディスクに書いた状態で、DB 行だけを追加する用途。
+    pub fn insert_prepared_blob_ref(
+        &self,
+        content_type: &ContentType,
+        text_preview: Option<&str>,
+        blob_sha256: &str,
+        byte_size: i64,
+        source_app: &str,
+    ) -> StorageResult<i64> {
+        self.insert_prepared_text(content_type, text_preview, None, Some(blob_sha256), byte_size, source_app)
+    }
+
+    pub fn get_recent_entries(&self, limit: i32) -> StorageResult<Vec<ClipboardEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM clipboard_entries
              ORDER BY created_at DESC, id DESC
              LIMIT ?1"
-        )?;
-
-        let entries = stmt.query_map(params![limit], |row| {
-            Ok(ClipboardEntry {
-                id: row.get(0)?,
-                content_type: ContentType::from_str(
-                    &row.get::<_, String>(1)?
-                ),
-                text_content: row.get(2)?,
-                image_data: None,
-                source_app: row.get(3)?,
-                created_at: row.get(4)?,
-                copy_count: row.get(5)?,
-                first_copied_at: row.get(6)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
-
+        ))?;
+        let entries = stmt.query_map(params![limit], row_to_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
 
-    pub fn get_entries_before(&self, before_timestamp: i64, limit: i32) -> Result<Vec<ClipboardEntry>, rusqlite::Error> {
+    pub fn get_entries_before(&self, before_timestamp: i64, limit: i32) -> StorageResult<Vec<ClipboardEntry>> {
         if before_timestamp <= 0 {
             return self.get_recent_entries(limit);
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content_type, text_content, source_app, created_at, copy_count, first_copied_at
-             FROM clipboard_entries
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS} FROM clipboard_entries
              WHERE created_at < ?1
              ORDER BY created_at DESC, id DESC
              LIMIT ?2"
-        )?;
-
-        let entries = stmt.query_map(params![before_timestamp, limit], |row| {
-            Ok(ClipboardEntry {
-                id: row.get(0)?,
-                content_type: ContentType::from_str(&row.get::<_, String>(1)?),
-                text_content: row.get(2)?,
-                image_data: None,
-                source_app: row.get(3)?,
-                created_at: row.get(4)?,
-                copy_count: row.get(5)?,
-                first_copied_at: row.get(6)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
-
+        ))?;
+        let entries = stmt.query_map(params![before_timestamp, limit], row_to_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
 
-    pub fn delete_entry(&self, id: i64) -> Result<bool, rusqlite::Error> {
+    pub fn delete_entry(&self, id: i64) -> StorageResult<bool> {
         let affected = self.conn.execute(
             "DELETE FROM clipboard_entries WHERE id = ?1",
             params![id],
@@ -204,26 +296,93 @@ impl Storage {
         Ok(affected > 0)
     }
 
-    pub fn get_entry_text(&self, id: i64) -> Result<Option<String>, rusqlite::Error> {
-        let result = self.conn.query_row(
-            "SELECT text_content FROM clipboard_entries WHERE id = ?1",
+    /// テキスト取得。優先順: text_content(inline) > blob 参照 > preview fallback。
+    /// blob 欠損時は preview を返し、呼び出し側でフラグ提示する用途を想定。
+    pub fn get_entry_text(&self, id: i64) -> StorageResult<Option<String>> {
+        let (preview, text_content, sha): (Option<String>, Option<String>, Option<String>) =
+            match self.conn.query_row(
+                "SELECT text_preview, text_content, blob_sha256 FROM clipboard_entries WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+
+        if let Some(inline) = text_content {
+            return Ok(Some(inline));
+        }
+        if let Some(sha) = sha {
+            if let Some(bytes) = self.blob_store.read(&sha)? {
+                match String::from_utf8(bytes) {
+                    Ok(s) => return Ok(Some(s)),
+                    Err(_) => return Ok(preview),
+                }
+            }
+            // blob 欠損 → preview で fallback
+            return Ok(preview);
+        }
+        Ok(preview)
+    }
+
+    /// 画像取得。blob 優先、旧 DB inline BLOB へも fallback。
+    pub fn get_entry_image(&self, id: i64) -> StorageResult<Option<Vec<u8>>> {
+        let (sha, legacy): (Option<String>, Option<Vec<u8>>) =
+            match self.conn.query_row(
+                "SELECT blob_sha256, image_data FROM clipboard_entries WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+
+        if let Some(sha) = sha {
+            return Ok(self.blob_store.read(&sha)?);
+        }
+        Ok(legacy)
+    }
+
+    /// エントリの blob_sha256 を単体取得。UI からのフル読み込み経路で使う。
+    pub fn get_entry_blob_sha256(&self, id: i64) -> StorageResult<Option<String>> {
+        match self.conn.query_row(
+            "SELECT blob_sha256 FROM clipboard_entries WHERE id = ?1",
             params![id],
-            |row| row.get(0),
-        );
-        match result {
-            Ok(text) => Ok(text),
+            |row| row.get::<_, Option<String>>(0),
+        ) {
+            Ok(v) => Ok(v),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
+    /// blob 欠損検知用: エントリが blob 参照を持っており、かつ実ファイルが無いか。
+    /// UI 側で警告表示する判定用。
+    pub fn is_blob_missing(&self, id: i64) -> StorageResult<bool> {
+        let sha: Option<String> = match self.conn.query_row(
+            "SELECT blob_sha256 FROM clipboard_entries WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(match sha {
+            Some(s) => !self.blob_store.exists(&s),
+            None => false,
+        })
+    }
+
+    /// 平文 DB を暗号化された DB へコピーする（sqlcipher_export ベース）。
+    /// blob ファイルは DB とは別管理なのでここでは移動しない。
     pub fn migrate_to_encrypted(
         plain_path: &str,
         encrypted_path: &str,
         encryption_key: &str,
     ) -> Result<(), rusqlite::Error> {
-        // Validate inputs to prevent SQL injection in ATTACH DATABASE
-        // (parameterized queries are not supported for ATTACH)
         if encrypted_path.contains('\'') || encrypted_path.contains('\0') {
             return Err(rusqlite::Error::InvalidParameterName(
                 "encrypted_path contains invalid characters".to_string(),
@@ -245,71 +404,38 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_entry_image(&self, id: i64) -> Result<Option<Vec<u8>>, rusqlite::Error> {
-        let result = self.conn.query_row(
-            "SELECT image_data FROM clipboard_entries WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        );
-        match result {
-            Ok(data) => Ok(data),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    pub fn search_entries(&self, query: &str, limit: i32) -> Result<Vec<ClipboardEntry>, rusqlite::Error> {
+    pub fn search_entries(&self, query: &str, limit: i32) -> StorageResult<Vec<ClipboardEntry>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return self.get_recent_entries(limit);
         }
-
-        // Sanitize FTS5 special characters: remove * (prefix operator) and escape double quotes
         let sanitized = trimmed.replace('*', "");
         let escaped = sanitized.replace('"', "\"\"");
-        let fts_query = if escaped.is_empty() {
+        if escaped.is_empty() {
             return self.get_recent_entries(limit);
-        } else {
-            format!("\"{}\"*", escaped)
-        };
+        }
+        let fts_query = format!("\"{}\"*", escaped);
 
-        let mut stmt = self.conn.prepare(
-            "SELECT e.id, e.content_type, e.text_content, e.source_app, e.created_at, e.copy_count, e.first_copied_at
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SELECT_COLS_QUALIFIED}
              FROM clipboard_entries e
              INNER JOIN clipboard_fts f ON e.id = f.rowid
-             WHERE f.text_content MATCH ?1
+             WHERE f.text_preview MATCH ?1
                AND e.content_type != ?2
              ORDER BY e.created_at DESC
              LIMIT ?3"
-        )?;
+        ))?;
 
         let entries = stmt.query_map(
             params![fts_query, ContentType::Image.as_str(), limit],
-            |row| {
-                Ok(ClipboardEntry {
-                    id: row.get(0)?,
-                    content_type: ContentType::from_str(
-                        &row.get::<_, String>(1)?
-                    ),
-                    text_content: row.get(2)?,
-                    image_data: None,
-                    source_app: row.get(3)?,
-                    created_at: row.get(4)?,
-                    copy_count: row.get(5)?,
-                    first_copied_at: row.get(6)?,
-                })
-            }
+            row_to_entry,
         )?.collect::<Result<Vec<_>, _>>()?;
 
         Ok(entries)
     }
 
-    pub fn touch_entry(&self, id: i64) -> Result<bool, rusqlite::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime before UNIX_EPOCH")
-            .as_millis() as i64;
-
+    pub fn touch_entry(&self, id: i64) -> StorageResult<bool> {
+        let now = now_millis();
         let affected = self.conn.execute(
             "UPDATE clipboard_entries SET created_at = ?1, copy_count = copy_count + 1 WHERE id = ?2",
             params![now, id],
@@ -317,21 +443,94 @@ impl Storage {
         Ok(affected > 0)
     }
 
-    pub fn cleanup_old_entries(&self, max_age_days: i32) -> Result<u64, rusqlite::Error> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("SystemTime before UNIX_EPOCH")
-            .as_millis() as i64;
-
+    /// 期限切れエントリを削除し、参照が消えた blob を GC する。
+    /// 戻り値: (削除された DB エントリ数, 削除された blob ファイル数)。
+    pub fn cleanup_old_entries(&self, max_age_days: i32) -> StorageResult<(u64, u64)> {
+        let now = now_millis();
         let cutoff = now - (max_age_days as i64 * 86_400_000);
 
-        let affected = self.conn.execute(
+        let deleted_entries = self.conn.execute(
             "DELETE FROM clipboard_entries WHERE created_at < ?1",
             params![cutoff],
-        )?;
+        )? as u64;
 
-        Ok(affected as u64)
+        let referenced = self.list_referenced_blobs()?;
+        let removed = self.blob_store.gc_orphans(&referenced)?;
+        Ok((deleted_entries, removed.len() as u64))
     }
+
+    /// DB 内で現在参照されている全 blob_sha256 の一覧。GC 判定用。
+    pub fn list_referenced_blobs(&self) -> StorageResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT blob_sha256 FROM clipboard_entries WHERE blob_sha256 IS NOT NULL"
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+}
+
+// ─────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────
+
+const SELECT_COLS: &str = "id, content_type, text_preview, text_content, blob_sha256, byte_size, source_app, created_at, copy_count, first_copied_at";
+const SELECT_COLS_QUALIFIED: &str = "e.id, e.content_type, e.text_preview, e.text_content, e.blob_sha256, e.byte_size, e.source_app, e.created_at, e.copy_count, e.first_copied_at";
+
+fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<ClipboardEntry> {
+    Ok(ClipboardEntry {
+        id: row.get(0)?,
+        content_type: ContentType::from_str(&row.get::<_, String>(1)?),
+        text_preview: row.get(2)?,
+        text_content: row.get(3)?,
+        blob_sha256: row.get(4)?,
+        byte_size: row.get(5)?,
+        image_data: None,
+        source_app: row.get(6)?,
+        created_at: row.get(7)?,
+        copy_count: row.get(8)?,
+        first_copied_at: row.get(9)?,
+    })
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH")
+        .as_millis() as i64
+}
+
+/// UTF-8 の char 境界を尊重した先頭 N バイト切り出し。
+/// 途中で multi-byte を割らないよう境界まで戻す。
+pub(crate) fn utf8_prefix(s: &str, byte_limit: usize) -> String {
+    if s.len() <= byte_limit {
+        return s.to_string();
+    }
+    let mut end = byte_limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn default_blob_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.join("blobs"))
+        .unwrap_or_else(|| PathBuf::from("blobs"))
+}
+
+fn tmp_blob_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("cb_storage_test_{pid}_{now_ns}_{n}"))
 }
 
 #[cfg(test)]
@@ -351,7 +550,10 @@ mod tests {
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text_content.as_deref(), Some("Hello, world!"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("Hello, world!"));
         assert_eq!(entries[0].source_app.as_deref(), Some("TestApp"));
+        assert_eq!(entries[0].byte_size, 13);
+        assert!(entries[0].blob_sha256.is_none());
     }
 
     #[test]
@@ -363,7 +565,9 @@ mod tests {
 
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].image_data.is_none()); // list queries don't fetch image_data
+        assert!(entries[0].image_data.is_none());
+        assert!(entries[0].blob_sha256.is_some());
+        assert_eq!(entries[0].byte_size, image_data.len() as i64);
         let fetched = storage.get_entry_image(entries[0].id).unwrap();
         assert_eq!(fetched.as_deref(), Some(image_data.as_slice()));
     }
@@ -371,15 +575,9 @@ mod tests {
     #[test]
     fn test_delete_entry() {
         let storage = Storage::new_in_memory().unwrap();
-        let id = storage.insert_text_entry(
-            &ContentType::PlainText,
-            "Delete me",
-            "TestApp",
-        ).unwrap();
-
+        let id = storage.insert_text_entry(&ContentType::PlainText, "Delete me", "TestApp").unwrap();
         assert!(storage.delete_entry(id).unwrap());
         assert!(!storage.delete_entry(id).unwrap());
-
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries.len(), 0);
     }
@@ -387,17 +585,9 @@ mod tests {
     #[test]
     fn test_get_entry_text() {
         let storage = Storage::new_in_memory().unwrap();
-        let id = storage.insert_text_entry(
-            &ContentType::PlainText,
-            "Find me",
-            "TestApp",
-        ).unwrap();
-
-        let text = storage.get_entry_text(id).unwrap();
-        assert_eq!(text.as_deref(), Some("Find me"));
-
-        let missing = storage.get_entry_text(9999).unwrap();
-        assert!(missing.is_none());
+        let id = storage.insert_text_entry(&ContentType::PlainText, "Find me", "TestApp").unwrap();
+        assert_eq!(storage.get_entry_text(id).unwrap().as_deref(), Some("Find me"));
+        assert!(storage.get_entry_text(9999).unwrap().is_none());
     }
 
     #[test]
@@ -405,43 +595,31 @@ mod tests {
         let storage = Storage::new_in_memory().unwrap();
         let image_data = vec![0xFF, 0xD8, 0xFF, 0xE0];
         let id = storage.insert_image_entry(&image_data, "Preview").unwrap();
-
         let data = storage.get_entry_image(id).unwrap();
         assert_eq!(data.as_deref(), Some(image_data.as_slice()));
-
-        let missing = storage.get_entry_image(9999).unwrap();
-        assert!(missing.is_none());
+        assert!(storage.get_entry_image(9999).unwrap().is_none());
     }
 
     #[test]
     fn test_get_entry_image_for_text_entry() {
         let storage = Storage::new_in_memory().unwrap();
         let id = storage.insert_text_entry(&ContentType::PlainText, "Hello", "App").unwrap();
-
-        let data = storage.get_entry_image(id).unwrap();
-        assert!(data.is_none());
+        assert!(storage.get_entry_image(id).unwrap().is_none());
     }
 
     #[test]
     fn test_empty_database() {
         let storage = Storage::new_in_memory().unwrap();
-        let entries = storage.get_recent_entries(10).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert!(storage.get_recent_entries(10).unwrap().is_empty());
     }
 
     #[test]
     fn test_limit() {
         let storage = Storage::new_in_memory().unwrap();
         for i in 0..5 {
-            storage.insert_text_entry(
-                &ContentType::PlainText,
-                &format!("Entry {i}"),
-                "TestApp",
-            ).unwrap();
+            storage.insert_text_entry(&ContentType::PlainText, &format!("Entry {i}"), "TestApp").unwrap();
         }
-
-        let entries = storage.get_recent_entries(3).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(storage.get_recent_entries(3).unwrap().len(), 3);
     }
 
     #[test]
@@ -450,28 +628,24 @@ mod tests {
         storage.insert_text_entry(&ContentType::PlainText, "First", "App").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         storage.insert_text_entry(&ContentType::PlainText, "Second", "App").unwrap();
-
         let entries = storage.get_recent_entries(10).unwrap();
-        assert_eq!(entries[0].text_content.as_deref(), Some("Second"));
-        assert_eq!(entries[1].text_content.as_deref(), Some("First"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("Second"));
+        assert_eq!(entries[1].text_preview.as_deref(), Some("First"));
     }
 
     #[test]
     fn test_encrypted_db_roundtrip() {
-        let dir = std::env::temp_dir().join("cb_test_encrypted");
+        let dir = std::env::temp_dir().join("cb_test_encrypted_v2");
         let _ = std::fs::create_dir_all(&dir);
         let db_path = dir.join("encrypted.db");
         let _ = std::fs::remove_file(&db_path);
-
+        let _ = std::fs::remove_dir_all(dir.join("blobs"));
         let key = "test-encryption-key-256bit-base64";
 
-        // Write data with encryption key
         {
             let storage = Storage::new(db_path.to_str().unwrap(), Some(key)).unwrap();
             storage.insert_text_entry(&ContentType::PlainText, "Secret data", "TestApp").unwrap();
         }
-
-        // Reopen with same key — data should be readable
         {
             let storage = Storage::new(db_path.to_str().unwrap(), Some(key)).unwrap();
             let entries = storage.get_recent_entries(10).unwrap();
@@ -484,56 +658,46 @@ mod tests {
 
     #[test]
     fn test_encrypted_db_wrong_key_fails() {
-        let dir = std::env::temp_dir().join("cb_test_wrong_key");
+        let dir = std::env::temp_dir().join("cb_test_wrong_key_v2");
         let _ = std::fs::create_dir_all(&dir);
         let db_path = dir.join("encrypted.db");
         let _ = std::fs::remove_file(&db_path);
-
-        // Create encrypted DB
+        let _ = std::fs::remove_dir_all(dir.join("blobs"));
         {
             let storage = Storage::new(db_path.to_str().unwrap(), Some("correct-key")).unwrap();
             storage.insert_text_entry(&ContentType::PlainText, "Secret", "App").unwrap();
         }
-
-        // Open with wrong key — should fail
         let result = Storage::new(db_path.to_str().unwrap(), Some("wrong-key"));
         assert!(result.is_err());
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_migrate_to_encrypted() {
-        let dir = std::env::temp_dir().join("cb_test_migrate");
+        let dir = std::env::temp_dir().join("cb_test_migrate_v2");
         let _ = std::fs::create_dir_all(&dir);
         let plain_path = dir.join("plain.db");
         let encrypted_path = dir.join("migrated.db");
         let _ = std::fs::remove_file(&plain_path);
         let _ = std::fs::remove_file(&encrypted_path);
-
+        let _ = std::fs::remove_dir_all(dir.join("blobs"));
         let key = "migration-test-key";
 
-        // Create plain DB with data
         {
             let storage = Storage::new(plain_path.to_str().unwrap(), None).unwrap();
             storage.insert_text_entry(&ContentType::PlainText, "Migrate me", "App").unwrap();
             storage.insert_image_entry(&[0xFF, 0xD8], "Preview").unwrap();
         }
-
-        // Migrate to encrypted
         Storage::migrate_to_encrypted(
             plain_path.to_str().unwrap(),
             encrypted_path.to_str().unwrap(),
             key,
         ).unwrap();
-
-        // Open encrypted DB and verify data
         {
             let storage = Storage::new(encrypted_path.to_str().unwrap(), Some(key)).unwrap();
             let entries = storage.get_recent_entries(10).unwrap();
             assert_eq!(entries.len(), 2);
         }
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -542,10 +706,9 @@ mod tests {
         let storage = Storage::new_in_memory().unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Hello world", "App").unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Goodbye", "App").unwrap();
-
         let results = storage.search_entries("Hello", 10).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].text_content.as_deref(), Some("Hello world"));
+        assert_eq!(results[0].text_preview.as_deref(), Some("Hello world"));
     }
 
     #[test]
@@ -553,7 +716,6 @@ mod tests {
         let storage = Storage::new_in_memory().unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Testing prefix", "App").unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Another test", "App").unwrap();
-
         let results = storage.search_entries("test", 10).unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -563,135 +725,98 @@ mod tests {
         let storage = Storage::new_in_memory().unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Entry 1", "App").unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Entry 2", "App").unwrap();
-
-        let results = storage.search_entries("", 10).unwrap();
-        assert_eq!(results.len(), 2);
-
-        let results_whitespace = storage.search_entries("   ", 10).unwrap();
-        assert_eq!(results_whitespace.len(), 2);
+        assert_eq!(storage.search_entries("", 10).unwrap().len(), 2);
+        assert_eq!(storage.search_entries("   ", 10).unwrap().len(), 2);
     }
 
     #[test]
     fn test_search_entries_delete_sync() {
         let storage = Storage::new_in_memory().unwrap();
         let id = storage.insert_text_entry(&ContentType::PlainText, "Delete me", "App").unwrap();
-
-        let results_before = storage.search_entries("Delete", 10).unwrap();
-        assert_eq!(results_before.len(), 1);
-
+        assert_eq!(storage.search_entries("Delete", 10).unwrap().len(), 1);
         storage.delete_entry(id).unwrap();
-
-        let results_after = storage.search_entries("Delete", 10).unwrap();
-        assert_eq!(results_after.len(), 0);
+        assert_eq!(storage.search_entries("Delete", 10).unwrap().len(), 0);
     }
 
     #[test]
     fn test_cleanup_old_entries() {
         let storage = Storage::new_in_memory().unwrap();
-
-        // Insert old entry (simulate old timestamp)
-        let old_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64 - (100 * 86_400_000); // 100 days ago
-
+        let old_ts = now_millis() - (100 * 86_400_000);
         storage.conn.execute(
-            "INSERT INTO clipboard_entries (content_type, text_content, source_app, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![ContentType::PlainText.as_str(), "Old entry", "App", old_timestamp],
+            "INSERT INTO clipboard_entries (content_type, text_preview, text_content, byte_size, source_app, created_at, first_copied_at)
+             VALUES (?1, ?2, ?2, LENGTH(?2), ?3, ?4, ?4)",
+            params![ContentType::PlainText.as_str(), "Old entry", "App", old_ts],
         ).unwrap();
-
-        // Insert recent entry
         storage.insert_text_entry(&ContentType::PlainText, "Recent entry", "App").unwrap();
 
-        // Cleanup entries older than 30 days
-        let deleted = storage.cleanup_old_entries(30).unwrap();
-        assert_eq!(deleted, 1);
-
+        let (deleted_entries, _) = storage.cleanup_old_entries(30).unwrap();
+        assert_eq!(deleted_entries, 1);
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text_content.as_deref(), Some("Recent entry"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("Recent entry"));
     }
 
     #[test]
     fn test_cleanup_preserves_recent() {
         let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "Entry 1", "App").unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "Entry 2", "App").unwrap();
-
-        let deleted = storage.cleanup_old_entries(30).unwrap();
-        assert_eq!(deleted, 0);
-
-        let entries = storage.get_recent_entries(10).unwrap();
-        assert_eq!(entries.len(), 2);
+        storage.insert_text_entry(&ContentType::PlainText, "E1", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "E2", "App").unwrap();
+        let (deleted_entries, _) = storage.cleanup_old_entries(30).unwrap();
+        assert_eq!(deleted_entries, 0);
+        assert_eq!(storage.get_recent_entries(10).unwrap().len(), 2);
     }
 
     #[test]
     fn test_cleanup_empty_db() {
         let storage = Storage::new_in_memory().unwrap();
-        let deleted = storage.cleanup_old_entries(30).unwrap();
-        assert_eq!(deleted, 0);
+        let (deleted_entries, deleted_blobs) = storage.cleanup_old_entries(30).unwrap();
+        assert_eq!(deleted_entries, 0);
+        assert_eq!(deleted_blobs, 0);
     }
 
     #[test]
     fn test_get_entries_before_with_cursor() {
         let storage = Storage::new_in_memory().unwrap();
-
-        // Insert 5 entries with controlled timestamps
         let mut timestamps = Vec::new();
         for i in 0..5 {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64 + i;
-
+            let ts = now_millis() + i;
             storage.conn.execute(
-                "INSERT INTO clipboard_entries (content_type, text_content, source_app, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO clipboard_entries (content_type, text_preview, text_content, byte_size, source_app, created_at, first_copied_at)
+                 VALUES (?1, ?2, ?2, LENGTH(?2), ?3, ?4, ?4)",
                 params![ContentType::PlainText.as_str(), format!("Entry {i}"), "App", ts],
             ).unwrap();
             timestamps.push(ts);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-
-        // Get entries before the 3rd entry's timestamp (should return entries 0 and 1)
         let entries = storage.get_entries_before(timestamps[2], 10).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].text_content.as_deref(), Some("Entry 1"));
-        assert_eq!(entries[1].text_content.as_deref(), Some("Entry 0"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("Entry 1"));
+        assert_eq!(entries[1].text_preview.as_deref(), Some("Entry 0"));
     }
 
     #[test]
     fn test_get_entries_before_zero_timestamp() {
         let storage = Storage::new_in_memory().unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "Entry 1", "App").unwrap();
-        storage.insert_text_entry(&ContentType::PlainText, "Entry 2", "App").unwrap();
-
-        // before_timestamp=0 should behave like get_recent_entries
-        let entries = storage.get_entries_before(0, 10).unwrap();
-        assert_eq!(entries.len(), 2);
+        storage.insert_text_entry(&ContentType::PlainText, "E1", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "E2", "App").unwrap();
+        assert_eq!(storage.get_entries_before(0, 10).unwrap().len(), 2);
     }
 
     #[test]
     fn test_get_entries_before_empty_db() {
         let storage = Storage::new_in_memory().unwrap();
-        let entries = storage.get_entries_before(999999999, 10).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert!(storage.get_entries_before(999999999, 10).unwrap().is_empty());
     }
 
     #[test]
     fn test_touch_entry() {
         let storage = Storage::new_in_memory().unwrap();
         let id = storage.insert_text_entry(&ContentType::PlainText, "Touch me", "App").unwrap();
-
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries[0].copy_count, 1);
         let original_first_copied = entries[0].first_copied_at;
-
         std::thread::sleep(std::time::Duration::from_millis(10));
-
         assert!(storage.touch_entry(id).unwrap());
-
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries[0].copy_count, 2);
         assert!(entries[0].created_at > original_first_copied);
@@ -704,17 +829,11 @@ mod tests {
         let id1 = storage.insert_text_entry(&ContentType::PlainText, "First", "App").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         storage.insert_text_entry(&ContentType::PlainText, "Second", "App").unwrap();
-
-        // Second is on top
-        let entries = storage.get_recent_entries(10).unwrap();
-        assert_eq!(entries[0].text_content.as_deref(), Some("Second"));
-
+        assert_eq!(storage.get_recent_entries(10).unwrap()[0].text_preview.as_deref(), Some("Second"));
         std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Touch first, it should move to top
         storage.touch_entry(id1).unwrap();
         let entries = storage.get_recent_entries(10).unwrap();
-        assert_eq!(entries[0].text_content.as_deref(), Some("First"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("First"));
         assert_eq!(entries[0].copy_count, 2);
     }
 
@@ -728,7 +847,6 @@ mod tests {
     fn test_new_entry_has_copy_count_and_first_copied() {
         let storage = Storage::new_in_memory().unwrap();
         storage.insert_text_entry(&ContentType::PlainText, "Hello", "App").unwrap();
-
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries[0].copy_count, 1);
         assert_eq!(entries[0].first_copied_at, entries[0].created_at);
@@ -737,50 +855,183 @@ mod tests {
     #[test]
     fn test_get_entries_before_boundary() {
         let storage = Storage::new_in_memory().unwrap();
-
-        // Insert 3 entries with same timestamp
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
+        let ts = now_millis();
         for i in 0..3 {
             storage.conn.execute(
-                "INSERT INTO clipboard_entries (content_type, text_content, source_app, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO clipboard_entries (content_type, text_preview, text_content, byte_size, source_app, created_at, first_copied_at)
+                 VALUES (?1, ?2, ?2, LENGTH(?2), ?3, ?4, ?4)",
                 params![ContentType::PlainText.as_str(), format!("Entry {i}"), "App", ts],
             ).unwrap();
         }
-
-        // Query with that exact timestamp should exclude all entries
-        let entries = storage.get_entries_before(ts, 10).unwrap();
-        assert_eq!(entries.len(), 0);
-
-        // Query with timestamp+1 should include all entries
-        let entries = storage.get_entries_before(ts + 1, 10).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(storage.get_entries_before(ts, 10).unwrap().len(), 0);
+        assert_eq!(storage.get_entries_before(ts + 1, 10).unwrap().len(), 3);
     }
 
     #[test]
     fn test_millisecond_precision_ordering() {
         let storage = Storage::new_in_memory().unwrap();
-        // Insert entries with 1ms difference using direct SQL
-        let base_ts: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
+        let base_ts = now_millis();
         for i in 0..3 {
             storage.conn.execute(
-                "INSERT INTO clipboard_entries (content_type, text_content, source_app, created_at, first_copied_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                "INSERT INTO clipboard_entries (content_type, text_preview, text_content, byte_size, source_app, created_at, first_copied_at)
+                 VALUES (?1, ?2, ?2, LENGTH(?2), ?3, ?4, ?4)",
                 params![ContentType::PlainText.as_str(), format!("Entry {i}"), "App", base_ts + i],
             ).unwrap();
         }
-
         let entries = storage.get_recent_entries(10).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].text_content.as_deref(), Some("Entry 2"));
-        assert_eq!(entries[2].text_content.as_deref(), Some("Entry 0"));
+        assert_eq!(entries[0].text_preview.as_deref(), Some("Entry 2"));
+        assert_eq!(entries[2].text_preview.as_deref(), Some("Entry 0"));
+    }
+
+    // ─────────────────────────────────────────────
+    // 新規: blob externalization / 閾値変更耐性 / GC
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn test_large_text_externalized_to_blob() {
+        let storage = Storage::new_in_memory().unwrap();
+        let big = "A".repeat(TEXT_EXTERNALIZE_THRESHOLD_BYTES + 100);
+        let id = storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+
+        let entries = storage.get_recent_entries(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        // 大サイズは text_content が None、blob_sha256 が Some
+        assert!(entries[0].text_content.is_none());
+        assert!(entries[0].blob_sha256.is_some());
+        assert_eq!(entries[0].byte_size, big.len() as i64);
+        // preview は先頭 PREVIEW_BYTES バイトまで
+        assert!(entries[0].text_preview.as_ref().unwrap().len() <= PREVIEW_BYTES);
+        // フル取得は blob 経由で復元される
+        assert_eq!(storage.get_entry_text(id).unwrap().as_deref(), Some(big.as_str()));
+    }
+
+    #[test]
+    fn test_small_text_stays_inline() {
+        let storage = Storage::new_in_memory().unwrap();
+        let small = "small text";
+        storage.insert_text_entry(&ContentType::PlainText, small, "App").unwrap();
+        let entries = storage.get_recent_entries(10).unwrap();
+        assert!(entries[0].text_content.is_some());
+        assert!(entries[0].blob_sha256.is_none());
+    }
+
+    #[test]
+    fn test_threshold_agnostic_read_after_change() {
+        // 閾値T1相当で大サイズ保存 → 閾値T2に相当する読み出しでも問題なし。
+        // 実際には THRESHOLD は const だが「保存済みデータの読み方は保存時の閾値に依存しない」不変を確認。
+        let storage = Storage::new_in_memory().unwrap();
+
+        // inline エントリと blob エントリを同一DBに混在
+        let inline_id = storage.insert_text_entry(&ContentType::PlainText, "inline", "App").unwrap();
+        let big = "B".repeat(TEXT_EXTERNALIZE_THRESHOLD_BYTES + 500);
+        let blob_id = storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+
+        assert_eq!(storage.get_entry_text(inline_id).unwrap().as_deref(), Some("inline"));
+        assert_eq!(storage.get_entry_text(blob_id).unwrap().as_deref(), Some(big.as_str()));
+    }
+
+    #[test]
+    fn test_missing_blob_falls_back_to_preview() {
+        let storage = Storage::new_in_memory().unwrap();
+        let big = "C".repeat(TEXT_EXTERNALIZE_THRESHOLD_BYTES + 200);
+        let id = storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+
+        // blob ファイルを手動削除
+        let sha = storage.get_recent_entries(10).unwrap()[0].blob_sha256.clone().unwrap();
+        assert!(storage.blob_store.delete(&sha).unwrap());
+        assert!(storage.is_blob_missing(id).unwrap());
+
+        // preview で fallback (最大 PREVIEW_BYTES 分の C)
+        let recovered = storage.get_entry_text(id).unwrap();
+        assert!(recovered.is_some());
+        assert!(recovered.unwrap().starts_with("CCC"));
+    }
+
+    #[test]
+    fn test_image_always_externalized() {
+        let storage = Storage::new_in_memory().unwrap();
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let id = storage.insert_image_entry(&data, "App").unwrap();
+
+        let entries = storage.get_recent_entries(10).unwrap();
+        assert!(entries[0].blob_sha256.is_some());
+        assert_eq!(storage.get_entry_image(id).unwrap().as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn test_blob_dedup_between_entries() {
+        let storage = Storage::new_in_memory().unwrap();
+        let big = "D".repeat(TEXT_EXTERNALIZE_THRESHOLD_BYTES + 10);
+        storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+
+        let entries = storage.get_recent_entries(10).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].blob_sha256, entries[1].blob_sha256);
+
+        // blob ストア上のファイル数は 1 のまま
+        assert_eq!(storage.blob_store.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_gc_removes_orphan_blobs() {
+        let storage = Storage::new_in_memory().unwrap();
+        let old_ts = now_millis() - (100 * 86_400_000);
+        let big = "E".repeat(TEXT_EXTERNALIZE_THRESHOLD_BYTES + 10);
+        // 古い blob エントリ 2 件（内容は別々にして 2 blob）
+        let big_a = format!("{big}A");
+        let big_b = format!("{big}B");
+        let sha_a = storage.blob_store.write(big_a.as_bytes()).unwrap();
+        let sha_b = storage.blob_store.write(big_b.as_bytes()).unwrap();
+        for (sha, text) in [(&sha_a, &big_a), (&sha_b, &big_b)] {
+            storage.conn.execute(
+                "INSERT INTO clipboard_entries (content_type, text_preview, blob_sha256, byte_size, source_app, created_at, first_copied_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![ContentType::PlainText.as_str(), &text[..100], sha, text.len() as i64, "App", old_ts],
+            ).unwrap();
+        }
+        // 新しい blob エントリ 1 件（残る）
+        let recent = format!("{big}KEEP");
+        storage.insert_text_entry(&ContentType::PlainText, &recent, "App").unwrap();
+        let recent_sha = storage.get_recent_entries(1).unwrap()[0].blob_sha256.clone().unwrap();
+
+        assert_eq!(storage.blob_store.list_all().unwrap().len(), 3);
+
+        let (deleted_entries, deleted_blobs) = storage.cleanup_old_entries(30).unwrap();
+        assert_eq!(deleted_entries, 2);
+        assert_eq!(deleted_blobs, 2);
+        assert!(storage.blob_store.exists(&recent_sha));
+        assert!(!storage.blob_store.exists(&sha_a));
+        assert!(!storage.blob_store.exists(&sha_b));
+    }
+
+    #[test]
+    fn test_utf8_prefix_respects_char_boundary() {
+        let s = "あいうえお"; // 3バイト×5 = 15バイト
+        // 4バイトで切ると "あ" (3バイト) までにトリムされるはず
+        let out = utf8_prefix(s, 4);
+        assert_eq!(out, "あ");
+        // 6バイトなら "あい"
+        let out = utf8_prefix(s, 6);
+        assert_eq!(out, "あい");
+        // 制限が長いなら全体
+        let out = utf8_prefix(s, 100);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn test_search_ignores_full_text_beyond_preview() {
+        // preview は先頭 PREVIEW_BYTES のみ FTS に載る前提の確認。
+        // 大きな文字列の末尾にしか出現しないキーワードは検索でヒットしない。
+        let storage = Storage::new_in_memory().unwrap();
+        let mut big = "F".repeat(PREVIEW_BYTES + 100);
+        big.push_str(" NEEDLE_AT_END");
+        // 十分大きく、かつ blob 化される値にする
+        while big.len() <= TEXT_EXTERNALIZE_THRESHOLD_BYTES { big.push('X'); }
+        storage.insert_text_entry(&ContentType::PlainText, &big, "App").unwrap();
+
+        let results = storage.search_entries("NEEDLE_AT_END", 10).unwrap();
+        assert!(results.is_empty(), "preview 外の文字列は FTS で見つからない");
     }
 }
