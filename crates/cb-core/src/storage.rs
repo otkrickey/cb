@@ -407,14 +407,15 @@ impl Storage {
 
     /// 暗号化キーの許可文字集合をホワイトリスト検証する。
     /// hex 単独ではなく、UUID(hyphen) や base64(+/=) 由来のキーも許可する。
+    /// ASCII 限定 (`is_ascii_alphanumeric`) にして、全角英数字等の意図しない文字を弾く。
     fn validate_encryption_key(key: &str) -> Result<(), rusqlite::Error> {
         if key.is_empty()
             || !key
                 .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '+' | '/' | '='))
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '/' | '='))
         {
             return Err(rusqlite::Error::InvalidParameterName(
-                "encryption_key contains invalid characters (only alphanumeric, -, +, /, = allowed)"
+                "encryption_key contains invalid characters (only ASCII alphanumeric, -, +, /, = allowed)"
                     .to_string(),
             ));
         }
