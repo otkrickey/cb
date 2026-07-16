@@ -184,9 +184,7 @@ struct HistoryPanel: View {
 
     @ViewBuilder
     private func contentPreview(for entry: ClipboardEntryModel) -> some View {
-        if let text = entry.textContent {
-            SelectableTextView(text: text)
-        } else if entry.isImage {
+        if entry.isImage {
             if let nsImage = viewModel.loadImage(for: entry.id) {
                 Image(nsImage: nsImage)
                     .resizable()
@@ -202,6 +200,23 @@ struct HistoryPanel: View {
                         .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else if let text = entry.textContent {
+            SelectableTextView(text: text)
+        } else if let preview = entry.textPreview, !preview.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                SelectableTextView(text: preview)
+                if entry.isExternalized {
+                    Label(
+                        entry.formattedByteSize.map { "先頭のみ表示・全 \($0) はペースト時に復元" }
+                            ?? "先頭のみ表示",
+                        systemImage: "arrow.down.doc"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                }
             }
         }
     }
@@ -227,9 +242,17 @@ struct HistoryPanel: View {
                     Divider().padding(.leading, 16)
                     infoRow(label: "Words", value: "\(entry.wordCount)")
                 }
+                if let size = entry.formattedByteSize {
+                    Divider().padding(.leading, 16)
+                    infoRow(label: "Size", value: size)
+                }
+                if entry.isExternalized {
+                    Divider().padding(.leading, 16)
+                    infoRow(label: "Storage", value: "外部ファイル")
+                }
                 if entry.isImage, let nsImage = viewModel.loadImage(for: entry.id) {
                     Divider().padding(.leading, 16)
-                    infoRow(label: "Size", value: "\(Int(nsImage.size.width)) x \(Int(nsImage.size.height))")
+                    infoRow(label: "Dimensions", value: "\(Int(nsImage.size.width)) x \(Int(nsImage.size.height))")
                 }
                 Divider().padding(.leading, 16)
                 infoRow(label: "Times copied", value: "\(entry.copyCount)")
