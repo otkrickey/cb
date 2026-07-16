@@ -97,6 +97,16 @@ struct ClipboardEntryModel: Identifiable, Codable {
         return ""
     }
 
+    /// 人間可読なバイトサイズ表記。ゼロや取得不能な場合は nil。
+    var formattedByteSize: String? {
+        let size = byteSize
+        guard size > 0 else { return nil }
+        let bcf = ByteCountFormatter()
+        bcf.countStyle = .file
+        bcf.allowedUnits = [.useKB, .useMB, .useGB]
+        return bcf.string(fromByteCount: size)
+    }
+
     var relativeTime: String {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short

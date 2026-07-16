@@ -28,6 +28,13 @@ struct ClipboardItemRow: View {
                 .foregroundStyle(.primary)
 
             Spacer(minLength: 0)
+
+            if entry.isExternalized, let size = entry.formattedByteSize {
+                Text(size)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -51,6 +58,8 @@ struct ClipboardItemRow: View {
                 }
             } else if let text = entry.textContent {
                 return NSItemProvider(object: text as NSString)
+            } else if entry.isExternalized, let rustStr = get_entry_text(entry.id) {
+                return NSItemProvider(object: rustStr.toString() as NSString)
             } else {
                 return NSItemProvider()
             }
