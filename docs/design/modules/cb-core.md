@@ -140,47 +140,53 @@ static STORAGE: Mutex<Option<Storage>> = Mutex::new(None);
 CREATE TABLE IF NOT EXISTS clipboard_entries (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     content_type    TEXT NOT NULL,
-    text_content    TEXT,
-    image_data      BLOB,
+    text_preview    TEXT,                 -- 先頭 PREVIEW_BYTES (8KB) の UTF-8 抜粋 (FTS5 索引対象)
+    text_content    TEXT,                 -- 閾値未満のフルテキスト (外部化時は NULL)
+    image_data      BLOB,                 -- レガシー画像 inline (新規は blob_sha256 経由)
+    blob_sha256     TEXT,                 -- 外部化時のみ設定される blob 参照
+    byte_size       INTEGER NOT NULL DEFAULT 0,  -- フル本文/画像のバイト数
     source_app      TEXT,
-    created_at      INTEGER NOT NULL,   -- ミリ秒単位のUnixタイムスタンプ
+    created_at      INTEGER NOT NULL,     -- ミリ秒単位のUnixタイムスタンプ
     copy_count      INTEGER NOT NULL DEFAULT 1,
     first_copied_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_created_at ON clipboard_entries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_blob_sha256 ON clipboard_entries(blob_sha256) WHERE blob_sha256 IS NOT NULL;
 
--- FTS5仮想テーブル（外部コンテンツ）
-CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_fts
-USING fts5(text_content, content='clipboard_entries', content_rowid='id');
+-- FTS5仮想テーブル (text_preview を索引化。8KB を超える本文は検索不可)
+CREATE VIRTUAL TABLE clipboard_fts
+USING fts5(text_preview, content='clipboard_entries', content_rowid='id');
 
 -- INSERT時の自動同期トリガー
-CREATE TRIGGER IF NOT EXISTS clipboard_entries_ai
+CREATE TRIGGER clipboard_entries_ai
 AFTER INSERT ON clipboard_entries BEGIN
-    INSERT INTO clipboard_fts(rowid, text_content) VALUES (new.id, new.text_content);
+    INSERT INTO clipboard_fts(rowid, text_preview) VALUES (new.id, new.text_preview);
 END;
 
 -- DELETE時の自動同期トリガー
-CREATE TRIGGER IF NOT EXISTS clipboard_entries_ad
+CREATE TRIGGER clipboard_entries_ad
 AFTER DELETE ON clipboard_entries BEGIN
-    INSERT INTO clipboard_fts(clipboard_fts, rowid, text_content)
-    VALUES ('delete', old.id, old.text_content);
+    INSERT INTO clipboard_fts(clipboard_fts, rowid, text_preview)
+    VALUES ('delete', old.id, old.text_preview);
 END;
 
--- スキーママイグレーション（各カラムを独立チェックし、未存在の場合のみ追加）
--- ALTER TABLE clipboard_entries ADD COLUMN copy_count INTEGER NOT NULL DEFAULT 1;  -- 独立チェック
--- ALTER TABLE clipboard_entries ADD COLUMN first_copied_at INTEGER NOT NULL DEFAULT 0;  -- 独立チェック
+-- スキーママイグレーション (各カラムを独立チェックし、未存在の場合のみ追加)
+-- ALTER TABLE clipboard_entries ADD COLUMN copy_count / first_copied_at / text_preview / blob_sha256 / byte_size ...;
+-- 追加後のバックフィル (未設定行のみ):
 -- UPDATE clipboard_entries SET first_copied_at = created_at WHERE first_copied_at = 0;
+-- UPDATE clipboard_entries SET text_preview = SUBSTR(text_content, 1, 8192) WHERE text_preview IS NULL AND text_content IS NOT NULL;
+-- UPDATE clipboard_entries SET byte_size = COALESCE(LENGTH(text_content), LENGTH(image_data), 0) WHERE byte_size = 0 AND (text_content IS NOT NULL OR image_data IS NOT NULL);
 
--- タイムスタンプマイグレーション（秒→ミリ秒、冪等性あり）
+-- タイムスタンプマイグレーション (秒→ミリ秒、冪等)
 -- UPDATE clipboard_entries SET created_at = created_at * 1000 WHERE created_at > 0 AND created_at < 10000000000;
--- UPDATE clipboard_entries SET first_copied_at = first_copied_at * 1000 WHERE first_copied_at > 0 AND first_copied_at < 10000000000;
 
--- FTSインデックスのリビルド（メインテーブルとの行数不一致時のみ実行）
--- 毎起動の無条件リビルドを廃止し、大規模DBでの起動遅延を回避
+-- FTS5 インデックスの再構築 (rebuild_fts で init_schema 内から実行)
+-- 旧スキーマ (text_content 索引) を破棄して text_preview 索引で作り直す
 INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');
 ```
 
-DBファイル: `~/Library/Application Support/CB/clipboard.db`
+- DBファイル: `~/Library/Application Support/CB/clipboard.db`
+- blob 保管ディレクトリ: DB と同階層の `blobs/`
 
 ---
 
