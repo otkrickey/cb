@@ -376,23 +376,33 @@ impl Storage {
         })
     }
 
-    /// ATTACH DATABASE で使うパスをホワイトリスト検証する。
-    /// ATTACH はパラメータ化クエリを受け付けないため、format! で埋め込む前に
-    /// SQL インジェクションを構造的に不可能にする。
-    /// 許可: 英数字 / `/` `\` `-` `_` `.` ` ` `:` `~`
+    /// パスの最小限の検証: 空文字と NUL バイトのみ拒否する。
+    /// NUL は C 文字列を切ってしまい、以降が黙って落ちる (silent truncation)
+    /// ため必ず弾く必要がある。それ以外の記号は macOS の実運用パス (例:
+    /// `~/Library/Application Support/CB/`、`O'Brien (backup).db`) を通したいので
+    /// 許容する。SQL 文字列に埋め込む場合は呼び出し側で `escape_sql_string_literal`
+    /// を通してから format! すること。
     fn validate_path(path: &str, param_name: &str) -> Result<(), rusqlite::Error> {
-        if path.is_empty()
-            || !path.chars().all(|c| {
-                c.is_alphanumeric()
-                    || matches!(c, '/' | '\\' | '-' | '_' | '.' | ' ' | ':' | '~')
-            })
-        {
+        if path.is_empty() {
             return Err(rusqlite::Error::InvalidParameterName(format!(
-                "{} contains invalid characters (only alphanumeric, /, \\, -, _, ., :, ~, space allowed)",
+                "{} is empty",
+                param_name,
+            )));
+        }
+        if path.contains('\0') {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "{} contains a NUL byte",
                 param_name,
             )));
         }
         Ok(())
+    }
+
+    /// SQLite の文字列リテラル (`'...'`) に埋め込むために `'` を `''` にエスケープする。
+    /// これにより ATTACH DATABASE 文の paths に含まれるアポストロフィが
+    /// 構文を破らずリテラル扱いになる。
+    fn escape_sql_string_literal(s: &str) -> String {
+        s.replace('\'', "''")
     }
 
     /// 暗号化キーの許可文字集合をホワイトリスト検証する。
@@ -422,28 +432,26 @@ impl Storage {
         encrypted_path: &str,
         encryption_key: &str,
     ) -> Result<(), rusqlite::Error> {
-        // encrypted_path は下で `format!("ATTACH DATABASE '{}' AS encrypted;")` に
-        // 埋め込むため、ATTACH がパラメータ化不可であることを踏まえ、SQL インジェクション
-        // 対策としてホワイトリスト検証する。
+        // 両パスとも空/NUL のみ拒否する軽量検証。以前は encrypted_path に厳しい
+        // ホワイトリストを掛けていたが、macOS のユーザディレクトリに `'` `(` `)`
+        // 等を含むケース (例: `O'Brien` account) を弾いてしまい、非対称になる問題
+        // があった (PR #15 review round 6 指摘)。SQL インジェクション対策は
+        // ATTACH 文への埋め込み前に `escape_sql_string_literal` で `'` を `''` に
+        // エスケープする方式に変更する。
+        Self::validate_path(plain_path, "plain_path")?;
         Self::validate_path(encrypted_path, "encrypted_path")?;
-        // plain_path は Connection::open にそのまま渡すだけで SQL 文字列には
-        // 埋め込まれない。旧仕様で許可されていた `'` `!` `(` `)` `$` 等の macOS 上
-        // で正当なパスを弾かないよう、ここでは空チェックのみに留める。
-        if plain_path.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "plain_path is empty".to_string(),
-            ));
-        }
         // encryption_key は PRAGMA 経由で渡すので format! には入らないが、
         // 空キーや制御文字を拒否するために検証する。
         Self::validate_encryption_key(encryption_key)?;
 
         let conn = Connection::open(plain_path)?;
         // encryption_key を format! に埋めず、ATTACH は KEY 無しで実行してから
-        // pragma_update で安全に鍵をセットする。
+        // pragma_update で安全に鍵をセットする。encrypted_path は SQL 文字列
+        // リテラルに埋め込むので `'` を `''` にエスケープする。
+        let escaped_encrypted = Self::escape_sql_string_literal(encrypted_path);
         conn.execute_batch(&format!(
             "ATTACH DATABASE '{}' AS encrypted;",
-            encrypted_path
+            escaped_encrypted
         ))?;
         conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
         conn.execute_batch(
@@ -1169,16 +1177,18 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_rejects_single_quote_in_encrypted_path() {
-        // encrypted_path は format! に埋め込まれるのでホワイトリスト検証で拒否される。
-        let err = Storage::migrate_to_encrypted("/tmp/plain.db", "/tmp/'evil.db", "abcd").unwrap_err();
+    fn test_migrate_rejects_nul_in_path() {
+        // NUL は C 文字列を切ってしまう silent truncation なので必ず拒否する。
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b\0evil.db", "abcd").unwrap_err();
         assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
     }
 
     #[test]
-    fn test_migrate_rejects_semicolon_in_encrypted_path() {
-        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/x;DROP.db", "abcd").unwrap_err();
-        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    fn test_escape_sql_string_literal_doubles_apostrophes() {
+        // format! に埋め込む前段でアポストロフィが `''` にエスケープされることを保証する。
+        assert_eq!(Storage::escape_sql_string_literal("O'Brien"), "O''Brien");
+        assert_eq!(Storage::escape_sql_string_literal("no quote"), "no quote");
+        assert_eq!(Storage::escape_sql_string_literal("multi 'quote' string"), "multi ''quote'' string");
     }
 
     #[test]
@@ -1233,15 +1243,15 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_accepts_plain_path_with_special_chars() {
-        // Connection::open にしか渡さない plain_path は macOS 上で正当な
-        // 記号 (アポストロフィ / 括弧 / スペース) を含んでいてもマイグレーションが
-        // 通ること。encrypted_path 側は SQL 埋め込みのため厳格に検証したまま。
-        let dir = std::env::temp_dir().join("cb_test_migrate_plain_special");
+    fn test_migrate_accepts_plain_and_encrypted_path_with_special_chars() {
+        // macOS の実運用では `O'Brien` のようなユーザ名を持つアカウント配下に
+        // plain / encrypted の兄弟 DB を置くのでどちらも `'` / `(` / `)` を含む
+        // ことになる。両方が同一ディレクトリ由来でも E2E で通ることを検証する。
+        let dir = std::env::temp_dir().join("cb_test_migrate_special_chars_dir_(O'Brien)");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let plain = dir.join("O'Brien (backup).db");
-        let encrypted = dir.join("encrypted.db");
+        let encrypted = dir.join("O'Brien encrypted.db");
         {
             let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
             s.insert_text_entry(&ContentType::PlainText, "hi", "App").unwrap();
@@ -1251,7 +1261,48 @@ mod tests {
             encrypted.to_str().unwrap(),
             "abcdefghijklmnop",
         )
-        .expect("plain_path with special chars must be accepted");
+        .expect("both paths with special chars must be accepted");
+
+        // 実際に鍵付きで開けて内容が読めることまで確認
+        let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text_content.as_deref(), Some("hi"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_defends_against_encrypted_path_injection() {
+        // encrypted_path に `';` の SQL 破壊シーケンスが含まれていても、
+        // format! 埋め込み前に `'` が `''` にエスケープされ、ATTACH 文が
+        // 破壊されないこと。実 DB 生成までは行かず (パスとして無効なので)、
+        // ATTACH レベルの構文エラーではなく IO/構文健全性エラーになる。
+        let dir = std::env::temp_dir().join("cb_test_migrate_injection_defense");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "hi", "App").unwrap();
+        }
+        // 意図的に SQL 破壊パターンを埋め込んだ encrypted_path
+        let malicious = dir
+            .join("evil'; DROP TABLE clipboard_entries; --.db")
+            .to_string_lossy()
+            .to_string();
+        // ここでは「ATTACH の破壊が起きないこと」を担保するのが目的。
+        // ファイル生成自体は成功する可能性 (macOS はほとんどの文字を許容) もあるので
+        // 結果の Ok/Err は問わず、後段の DROP が実行されていないことを確認する。
+        let _ = Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            &malicious,
+            "abcdefghijklmnop",
+        );
+        // 元 DB の clipboard_entries テーブルが破壊されずに読めること
+        let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1, "元 DB の clipboard_entries が DROP されていないこと");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

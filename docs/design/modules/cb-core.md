@@ -101,7 +101,7 @@ pub struct ClipboardEntry {
 |---------|------|
 | `Storage::new(db_path, encryption_key)` | DB初期化・暗号化キー設定（`PRAGMA key`）・スキーマ作成 |
 | `Storage::new_in_memory()` | テスト用インメモリDB |
-| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。`encrypted_path` (SQL文字列に埋め込む) と `encryption_key` はホワイトリスト検証 (`validate_path` / `validate_encryption_key`) してから ATTACH。`encryption_key` は `pragma_update` 経由で設定し format! に埋め込まない。`plain_path` は `Connection::open` にしか渡さないため空チェックのみ |
+| `Storage::migrate_to_encrypted(plain_path, encrypted_path, key)` | `sqlcipher_export`による平文→暗号化DB変換。両パスは空/NUL のみ拒否し、`encrypted_path` を format! で ATTACH 文に埋め込む前に `'` を `''` にエスケープ (`escape_sql_string_literal`)。`encryption_key` は `pragma_update` 経由で設定し format! に埋め込まない (併せて `validate_encryption_key` で空・不正文字を拒否)。macOS の `O'Brien` のような特殊文字を含むユーザディレクトリ配下でも動作する |
 | `insert_text_entry(content_type, text, source_app)` | テキスト系INSERT |
 | `insert_image_entry(image_data, source_app)` | 画像INSERT（BLOB） |
 | `get_recent_entries(limit)` | `created_at DESC, id DESC` で最新N件取得（ソート安定性保証） |
@@ -131,7 +131,7 @@ static STORAGE: Mutex<Option<Storage>> = Mutex::new(None);
 `rusqlite`の`bundled-sqlcipher`フィーチャーにより、SQLCipherによるAES-256ページレベル暗号化を実現:
 - `Storage::new()`で`PRAGMA key`を設定し、透過的に暗号化/復号
 - `encryption_key`が空文字列の場合は暗号化なし（テスト互換）
-- `migrate_to_encrypted()`で既存の平文DBを`sqlcipher_export`で暗号化DBへ変換。`encrypted_path`は`validate_path`のホワイトリスト検証、暗号化キーは`validate_encryption_key`で検証してから`pragma_update`経由で設定（format!に埋め込まないためSQLインジェクションを構造的に防止）。`plain_path`は`Connection::open`にしか渡さないため空チェックのみ
+- `migrate_to_encrypted()`で既存の平文DBを`sqlcipher_export`で暗号化DBへ変換。両パスは空/NULのみ拒否し、`encrypted_path`は format! 埋め込み前に `'` を `''` にエスケープ (`escape_sql_string_literal`)。`encryption_key`は`validate_encryption_key`で空・不正文字を拒否した上で`pragma_update`経由で設定 (format!に埋め込まない)。`O'Brien` のようなアポストロフィを含むユーザディレクトリ配下でも動作する
 - 暗号化キーはSwift側の`KeychainManager`がmacOS Keychainから取得・管理
 
 ### DBスキーマ
@@ -208,7 +208,7 @@ INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');
 
 | ファイル | テスト数 | 対象 |
 |----------|----------|------|
-| `crates/cb-core/src/storage.rs` | 52個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted バリデーション (ホワイトリスト/E2E/plain_path 記号許容/再実行) |
+| `crates/cb-core/src/storage.rs` | 53個 | Storage CRUD・暗号化・FTS5検索・ページネーション・クリーンアップ・touch_entry・ミリ秒精度ソート・blob 外部化 (dedup/GC/欠損fallback/UTF-8境界)・FTS5サニタイズ (特殊文字/クォート/演算子語含む英文の回帰)・migrate_to_encrypted (E2E/両パス記号許容/再実行/エスケープ/インジェクション防御) |
 | `crates/cb-core/src/blob_store.rs` | 7個 | blob 書き込み・読み出し・存在チェック・dedup・GC・削除 |
 
 ### 重要なテストケース
@@ -231,13 +231,15 @@ INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');
 **暗号化異常系**（`test_encrypted_db_wrong_key_fails`）:
 - 間違った暗号化キーでのDB読み出しが失敗する
 
-**マイグレーション**（`test_migrate_to_encrypted` / `test_migrate_accepts_valid_path_and_key` / `test_migrate_accepts_plain_path_with_special_chars` / `test_migrate_rerun_requires_caller_to_remove_target`）:
-- `sqlcipher_export`による平文→暗号化DB変換が正しく動作する。ホワイトリスト検証済のパス・鍵で E2E に成功する
-- `plain_path` に `'` `(` `)` 等の記号を含む macOS 上正当なパスもそのまま通す (encrypted_path のみ厳格)
+**マイグレーション**（`test_migrate_to_encrypted` / `test_migrate_accepts_valid_path_and_key` / `test_migrate_accepts_plain_and_encrypted_path_with_special_chars` / `test_migrate_rerun_requires_caller_to_remove_target`）:
+- `sqlcipher_export`による平文→暗号化DB変換が正しく動作する。E2E で暗号化 DB を鍵付きで開いて読み出しできる
+- `plain_path` / `encrypted_path` の両方に `'` `(` `)` 等の記号を含む macOS 上正当なパスもそのまま通す (`O'Brien` ユーザ想定)
 - 既存 `encrypted_path` への再実行は残骸を削除してから行うことで通る (SQLCipher の未定義挙動をテストで固定)
 
-**マイグレーション異常系**（`test_migrate_rejects_single_quote_in_encrypted_path` / `test_migrate_rejects_semicolon_in_encrypted_path` / `test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}`）:
-- `'` / `;` 等の非許可文字を含む `encrypted_path` (SQL 埋め込み対象)、`$` 等を含む鍵、および空文字の各引数を `InvalidParameterName` で拒否する
+**マイグレーション異常系 / インジェクション防御**（`test_migrate_rejects_special_chars_in_key` / `test_migrate_rejects_empty_{plain_path,encrypted_path,key}` / `test_migrate_rejects_nul_in_path` / `test_escape_sql_string_literal_doubles_apostrophes` / `test_migrate_defends_against_encrypted_path_injection`）:
+- 空文字 / NUL バイト / 鍵内の非許可文字を `InvalidParameterName` で拒否する
+- `'` は `''` に確実にエスケープされる (unit test)
+- `evil'; DROP TABLE ...; --` みたいな SQL 破壊パターンを `encrypted_path` に混ぜても、元 DB の clipboard_entries テーブルが破壊されないことを E2E で担保する
 
 **FTS5検索**（`test_search_entries_basic` / `test_search_entries_prefix_match` / `test_search_entries_empty_query_fallback` / `test_search_entries_delete_sync`）:
 - 基本的な全文検索、前方一致（`query*`）、空クエリのフォールバック、DELETE後のFTS同期
