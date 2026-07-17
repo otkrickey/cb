@@ -5,9 +5,9 @@
 | モジュール | 機能 | ステータス | 備考 |
 |-----------|------|-----------|------|
 | プロジェクト基盤 | XcodeGen (`project.yml`) + Cargo ワークスペース | `done` | `LSUIElement = true`, pre-buildでcargo自動実行 |
-| swift-bridge FFI | Swift ↔ Rust FFIブリッジ | `done` | 12関数公開、JSON文字列でデータ受け渡し |
-| データモデル | ClipboardEntry, ContentType | `done` | `#[serde(skip)]`でimage_dataをJSON除外、`copy_count`/`first_copied_at`保持 |
-| SQLiteストレージ | rusqlite bundled-sqlcipher、CRUD + FTS5 + ページネーション + touch_entry | `done` | `Mutex<Option<Storage>>`シングルトン、27テスト、スキーママイグレーション対応 |
+| swift-bridge FFI | Swift ↔ Rust FFIブリッジ | `done` | 17関数公開 (blob 外部化対応で `save_clipboard_text_v2` / `save_clipboard_blob_ref` / `get_entry_blob_sha256` / `is_blob_missing` / `blob_dir_path` を追加)、JSON文字列でデータ受け渡し |
+| データモデル | ClipboardEntry, ContentType | `done` | `#[serde(skip)]`でimage_dataをJSON除外、`copy_count`/`first_copied_at`/`text_preview`/`blob_sha256`/`byte_size` 保持 |
+| SQLiteストレージ | rusqlite bundled-sqlcipher、CRUD + FTS5 + ページネーション + touch_entry + blob 外部化 | `done` | `Mutex<Option<Storage>>`シングルトン、storage.rs 56 + blob_store.rs 7 = 63テスト、スキーママイグレーション対応、256KB 超テキスト・全画像を `<blob_dir>/<sha256>.bin` に外部化 |
 | クリップボード監視 | NSPasteboard.changeCountポーリング | `done` | 0.5秒間隔、コンテンツハッシュで重複スキップ |
 | メニューバーアプリ | MenuBarExtra + AppDelegate + Settings Scene | `done` | SF Symbol `clipboard`、⌘,で設定画面 |
 | 履歴パネルUI | Liquid Glass 二ペインレイアウト + 無限スクロール | `done` | GlassEffectContainer、720x480、ページネーション対応 |

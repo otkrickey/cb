@@ -63,7 +63,11 @@ SwiftUIビュー、ViewModel、ウィンドウ管理、入力ハンドリング�
 1. Application Support ディレクトリ作成（`~/Library/Application Support/CB/`）
 2. `KeychainManager.getOrCreateKey()` で暗号化キーを取得（なければ自動生成）
 3. 既存DBがプレーンか判定（SQLiteヘッダ `"SQLite format 3"` チェック）→ プレーンなら`clipboard_plain.db`にリネーム
-4. `clipboard_plain.db`が存在する場合、`migrate_database()` で暗号化DBへ変換 → 成功時にplainDB削除
+4. `clipboard_plain.db`が存在する場合:
+   1. `dbPath` に既存の暗号化 DB があれば `dbPath.migration-backup-<ts>` に **rename で退避** (直接削除しない)。稼働中の DB を誤って消さないための安全策
+   2. `migrate_database()` で暗号化DBへ変換
+   3. 成功時: plainDB を削除、バックアップも削除
+   4. 失敗時: バックアップを `dbPath` に戻して**ロールバック**、plainDB は残す (次回起動で再試行できるように)
 5. `init_storage(dbPath, encryptionKey)` で暗号化Storage初期化
 6. `cleanup_old_entries()` で保持期間（UserDefaults `retentionDays`、デフォルト7日）超過エントリを削除
 

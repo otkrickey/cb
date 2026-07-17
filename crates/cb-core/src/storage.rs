@@ -57,6 +57,10 @@ impl Storage {
     ) -> StorageResult<Self> {
         let conn = Connection::open(db_path)?;
         if let Some(key) = encryption_key {
+            // migrate_to_encrypted と同じホワイトリストで検証し、
+            // Storage::new と migrate_to_encrypted の間で受理条件を揃える。
+            // (PR #15 review 指摘: 同じ鍵が片方で通り片方で弾かれる非対称の解消)
+            Self::validate_encryption_key(key)?;
             conn.pragma_update(None, "key", key)?;
         }
         let blob_store = BlobStore::new(blob_dir)?;
@@ -376,31 +380,110 @@ impl Storage {
         })
     }
 
+    /// パスの最小限の検証: 空文字と NUL バイトのみ拒否する。
+    /// NUL は C 文字列を切ってしまい、以降が黙って落ちる (silent truncation)
+    /// ため必ず弾く必要がある。それ以外の記号は macOS の実運用パス (例:
+    /// `~/Library/Application Support/CB/`、`O'Brien (backup).db`) を通したいので
+    /// 許容する。SQL 文字列に埋め込む場合は呼び出し側で `escape_sql_string_literal`
+    /// を通してから format! すること。
+    fn validate_path(path: &str, param_name: &str) -> Result<(), rusqlite::Error> {
+        if path.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "{} is empty",
+                param_name,
+            )));
+        }
+        if path.contains('\0') {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "{} contains a NUL byte",
+                param_name,
+            )));
+        }
+        Ok(())
+    }
+
+    /// SQLite の文字列リテラル (`'...'`) に埋め込むために `'` を `''` にエスケープする。
+    /// これにより ATTACH DATABASE 文の paths に含まれるアポストロフィが
+    /// 構文を破らずリテラル扱いになる。
+    fn escape_sql_string_literal(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    /// 暗号化キーの許可文字集合をホワイトリスト検証する。
+    /// hex 単独ではなく、UUID(hyphen) や base64(+/=) 由来のキーも許可する。
+    /// ASCII 限定 (`is_ascii_alphanumeric`) にして、全角英数字等の意図しない文字を弾く。
+    fn validate_encryption_key(key: &str) -> Result<(), rusqlite::Error> {
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '/' | '='))
+        {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "encryption_key contains invalid characters (only ASCII alphanumeric, -, +, /, = allowed)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 平文 DB を暗号化された DB へコピーする（sqlcipher_export ベース）。
-    /// blob ファイルは DB とは別管理なのでここでは移動しない。
+    ///
+    /// - blob ファイルは DB とは別管理なのでここでは移動しない
+    /// - `encrypted_path` は **存在しないファイル** を指すこと。既存ファイルが
+    ///   ある状態で呼ぶと `InvalidParameterName` エラーを返す (SQLCipher の
+    ///   `sqlcipher_export` が未定義動作になる + 生きている暗号化 DB を
+    ///   silently 破壊してしまうリスクがあるため)。呼び出し側で既存ファイルが
+    ///   「壊れた残骸か」「生きている暗号化 DB か」を判別し、後者ならそもそも
+    ///   マイグレーション不要と判断すること
     pub fn migrate_to_encrypted(
         plain_path: &str,
         encrypted_path: &str,
         encryption_key: &str,
     ) -> Result<(), rusqlite::Error> {
-        if encrypted_path.contains('\'') || encrypted_path.contains('\0') {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "encrypted_path contains invalid characters".to_string(),
-            ));
-        }
-        if encryption_key.contains('\'') || encryption_key.contains('\0') {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "encryption_key contains invalid characters".to_string(),
-            ));
+        // 両パスとも空/NUL のみ拒否する軽量検証。以前は encrypted_path に厳しい
+        // ホワイトリストを掛けていたが、macOS のユーザディレクトリに `'` `(` `)`
+        // 等を含むケース (例: `O'Brien` account) を弾いてしまい、非対称になる問題
+        // があった (PR #15 review round 6 指摘)。SQL インジェクション対策は
+        // ATTACH 文への埋め込み前に `escape_sql_string_literal` で `'` を `''` に
+        // エスケープする方式に変更する。
+        Self::validate_path(plain_path, "plain_path")?;
+        Self::validate_path(encrypted_path, "encrypted_path")?;
+        // encryption_key は PRAGMA 経由で渡すので format! には入らないが、
+        // 空キーや制御文字を拒否するために検証する。
+        Self::validate_encryption_key(encryption_key)?;
+        // 契約: encrypted_path が既存の場合はここでガードする (docstring 参照)。
+        // 呼び出し側の削除忘れ / データ喪失リスクをコードで防ぐ defense-in-depth。
+        if std::path::Path::new(encrypted_path).exists() {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "encrypted_path already exists at {}; refuse to overwrite (caller must remove or reuse it)",
+                encrypted_path,
+            )));
         }
 
         let conn = Connection::open(plain_path)?;
+        // encryption_key を format! に埋めず、ATTACH は KEY 無しで実行してから
+        // pragma_update で安全に鍵をセットする。encrypted_path は SQL 文字列
+        // リテラルに埋め込むので `'` を `''` にエスケープする。
+        let escaped_encrypted = Self::escape_sql_string_literal(encrypted_path);
         conn.execute_batch(&format!(
-            "ATTACH DATABASE '{}' AS encrypted KEY '{}';
-             SELECT sqlcipher_export('encrypted');
-             DETACH DATABASE encrypted;",
-            encrypted_path, encryption_key
+            "ATTACH DATABASE '{}' AS encrypted;",
+            escaped_encrypted
         ))?;
+        // ATTACH は encrypted_path にファイルを作る。以降のステップで失敗した場合、
+        // 不完全なファイルが残ると次回起動時のリトライで別の障害要因になるので
+        // best-effort で削除する (PR #15 review Low 指摘)。
+        let result: Result<(), rusqlite::Error> = (|| {
+            conn.pragma_update(Some("encrypted"), "key", encryption_key)?;
+            conn.execute_batch(
+                "SELECT sqlcipher_export('encrypted');
+                 DETACH DATABASE encrypted;",
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(encrypted_path);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -409,8 +492,23 @@ impl Storage {
         if trimmed.is_empty() {
             return self.get_recent_entries(limit);
         }
-        let sanitized = trimmed.replace('*', "");
+        // FTS5 サニタイズ:
+        // 1) `*` はプレフィクス指示子として phrase 内でも解釈されうるので除去。
+        //    `^` `+` は現行の `unicode61` トークナイザでは元々セパレータとして
+        //    扱われるので実害はないが、将来トークナイザを変更した際に FTS5
+        //    構文文字として扱われる可能性があるため defense-in-depth で除去する
+        // 2) ダブルクォートは phrase 区切りなのでエスケープ
+        //
+        // AND/OR/NOT/NEAR 等の boolean 演算子はここでは触らない: 最終的に
+        // 全体を `"..."*` フレーズで括るので、フレーズ内では既に演算子として
+        // 解釈されない (FTS5 仕様)。単語単位で除去すると "salt and pepper" 等の
+        // 通常英文が破壊されて regression になる (PR #15 review 指摘)。
+        let sanitized: String = trimmed
+            .chars()
+            .filter(|c| !matches!(c, '*' | '^' | '+'))
+            .collect();
         let escaped = sanitized.replace('"', "\"\"");
+        let escaped = escaped.trim();
         if escaped.is_empty() {
             return self.get_recent_entries(limit);
         }
@@ -1033,5 +1131,290 @@ mod tests {
 
         let results = storage.search_entries("NEEDLE_AT_END", 10).unwrap();
         assert!(results.is_empty(), "preview 外の文字列は FTS で見つからない");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // FTS5 サニタイズ / migrate_to_encrypted バリデーション (#2, #3)
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_search_special_chars_do_not_break_query() {
+        // `*` `^` `+` を混ぜても FTS5 構文エラーにならず、除去された残り文字列で
+        // フレーズ検索されること。
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "prefix content", "App").unwrap();
+        let results = storage.search_entries("prefix*^+", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_only_removed_chars_falls_back_to_recent() {
+        // 除去対象文字だけで構成されたクエリはサニタイズ後に空になり、
+        // get_recent_entries フォールバックで全件返る。
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "a", "App").unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "b", "App").unwrap();
+        let results = storage.search_entries("^+*^+", 10).unwrap();
+        assert_eq!(results.len(), 2, "全て除去対象なので empty query fallback で全件");
+    }
+
+    #[test]
+    fn test_search_double_quotes_are_escaped() {
+        // クエリ内の `"` を `""` にエスケープした上でフレーズ検索されること。
+        // エスケープを忘れると `"foo"bar"` みたいなクエリでフレーズが早く閉じて
+        // 構文エラーになる。
+        let storage = Storage::new_in_memory().unwrap();
+        // ダブルクォートを含む本文をそのまま保存し、
+        // 検索側でも同じ文字列を投げてヒットすることを確認する。
+        storage
+            .insert_text_entry(&ContentType::PlainText, r#"say "hello""#, "App")
+            .unwrap();
+        let results = storage.search_entries(r#"say "hello""#, 10).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            r#"ダブルクォート含みのクエリでもエスケープされて "say ""hello"""* として実マッチする"#
+        );
+    }
+
+    // Regression tests (PR #15 review): 演算子相当の英単語を含む実データが
+    // 検索できなくなっていた回帰。フレーズ内では AND/OR/NOT/NEAR は元々演算子
+    // として解釈されないので、単語除去は撤去済み。
+
+    #[test]
+    fn test_search_finds_text_containing_and() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "salt and pepper", "App").unwrap();
+        let results = storage.search_entries("salt and pepper", 10).unwrap();
+        assert_eq!(results.len(), 1, "\"salt and pepper\" は自己再検索でヒットすべき");
+    }
+
+    #[test]
+    fn test_search_finds_text_containing_or() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "cash or credit", "App").unwrap();
+        let results = storage.search_entries("cash or credit", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_finds_text_containing_not() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "do not disturb", "App").unwrap();
+        let results = storage.search_entries("do not disturb", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_finds_text_containing_near() {
+        let storage = Storage::new_in_memory().unwrap();
+        storage.insert_text_entry(&ContentType::PlainText, "walk near park", "App").unwrap();
+        let results = storage.search_entries("walk near park", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_rejects_nul_in_encrypted_path() {
+        // NUL は C 文字列を切ってしまう silent truncation なので必ず拒否する。
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b\0evil.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_nul_in_plain_path() {
+        // plain_path 側の NUL 拒否も対称に担保する。
+        let err = Storage::migrate_to_encrypted("/tmp/a\0evil.db", "/tmp/b.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_escape_sql_string_literal_doubles_apostrophes() {
+        // format! に埋め込む前段でアポストロフィが `''` にエスケープされることを保証する。
+        assert_eq!(Storage::escape_sql_string_literal("O'Brien"), "O''Brien");
+        assert_eq!(Storage::escape_sql_string_literal("no quote"), "no quote");
+        assert_eq!(Storage::escape_sql_string_literal("multi 'quote' string"), "multi ''quote'' string");
+    }
+
+    #[test]
+    fn test_migrate_rejects_special_chars_in_key() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b.db", "abc'; DROP--").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_plain_path() {
+        let err = Storage::migrate_to_encrypted("", "/tmp/b.db", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_encrypted_path() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "", "abcd").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_rejects_empty_key() {
+        let err = Storage::migrate_to_encrypted("/tmp/a.db", "/tmp/b.db", "").unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+    }
+
+    #[test]
+    fn test_migrate_accepts_valid_path_and_key() {
+        // 実 DB 生成でエンドツーエンドに通ること。
+        let dir = std::env::temp_dir().join("cb_test_migrate_accepts_v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        let encrypted = dir.join("encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "secret", "App").unwrap();
+        }
+        Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .expect("migration should succeed with valid inputs");
+        // 暗号化された DB を鍵付きで開けて、内容が読めることを確認
+        let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text_content.as_deref(), Some("secret"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_accepts_plain_and_encrypted_path_with_special_chars() {
+        // macOS の実運用では `O'Brien` のようなユーザ名を持つアカウント配下に
+        // plain / encrypted の兄弟 DB を置くのでどちらも `'` / `(` / `)` を含む
+        // ことになる。両方が同一ディレクトリ由来でも E2E で通ることを検証する。
+        let dir = std::env::temp_dir().join("cb_test_migrate_special_chars_dir_(O'Brien)");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("O'Brien (backup).db");
+        let encrypted = dir.join("O'Brien encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "hi", "App").unwrap();
+        }
+        Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .expect("both paths with special chars must be accepted");
+
+        // 実際に鍵付きで開けて内容が読めることまで確認
+        let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text_content.as_deref(), Some("hi"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_defends_against_encrypted_path_injection() {
+        // encrypted_path に `';` の SQL 破壊シーケンスが含まれていても、
+        // format! 埋め込み前に `'` が `''` にエスケープされ、ATTACH 文が
+        // 破壊されないこと。実 DB 生成までは行かず (パスとして無効なので)、
+        // ATTACH レベルの構文エラーではなく IO/構文健全性エラーになる。
+        let dir = std::env::temp_dir().join("cb_test_migrate_injection_defense");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "hi", "App").unwrap();
+        }
+        // 意図的に SQL 破壊パターンを埋め込んだ encrypted_path
+        let malicious = dir
+            .join("evil'; DROP TABLE clipboard_entries; --.db")
+            .to_string_lossy()
+            .to_string();
+        // ここでは「ATTACH の破壊が起きないこと」を担保するのが目的。
+        // ファイル生成自体は成功する可能性 (macOS はほとんどの文字を許容) もあるので
+        // 結果の Ok/Err は問わず、後段の DROP が実行されていないことを確認する。
+        let _ = Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            &malicious,
+            "abcdefghijklmnop",
+        );
+        // 元 DB の clipboard_entries テーブルが破壊されずに読めること
+        let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert_eq!(all.len(), 1, "元 DB の clipboard_entries が DROP されていないこと");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_refuses_existing_encrypted_path() {
+        // 既存の encrypted_path に対しては明示的に InvalidParameterName を返す。
+        // これによりデータ喪失リスクを避け、呼び出し側に判断を委ねる。
+        let dir = std::env::temp_dir().join("cb_test_migrate_refuse_existing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        let encrypted = dir.join("encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "payload", "App").unwrap();
+        }
+        // 予め encrypted_path にダミーファイルを置いておく
+        std::fs::write(&encrypted, b"pretend this is an existing DB").unwrap();
+
+        let err = Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .unwrap_err();
+        assert!(matches!(err, rusqlite::Error::InvalidParameterName(_)));
+        // 既存ファイルは触られないこと
+        let content = std::fs::read(&encrypted).unwrap();
+        assert_eq!(content, b"pretend this is an existing DB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_rerun_requires_caller_to_remove_target() {
+        // 既存 encrypted_path があると Rust 側が Err を返すので、呼び出し側は
+        // ファイルを削除してから再実行する。ここでは「残骸を消してから
+        // 再実行すれば通る」ことを担保する。
+        let dir = std::env::temp_dir().join("cb_test_migrate_rerun");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain.db");
+        let encrypted = dir.join("encrypted.db");
+        {
+            let s = Storage::new(plain.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "rerun-payload", "App").unwrap();
+        }
+        // 1回目
+        Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .expect("first migration should succeed");
+        // 残骸を削除してから 2 回目
+        std::fs::remove_file(&encrypted).unwrap();
+        Storage::migrate_to_encrypted(
+            plain.to_str().unwrap(),
+            encrypted.to_str().unwrap(),
+            "abcdefghijklmnop",
+        )
+        .expect("migration after removing target should succeed");
+
+        let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
+        let all = s.get_recent_entries(10).unwrap();
+        assert!(all.iter().any(|e| e.text_content.as_deref() == Some("rerun-payload")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

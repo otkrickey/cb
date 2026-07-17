@@ -73,12 +73,18 @@ cbアプリのクリップボード履歴データベース（SQLite）を暗号
 **理由**:
 - SQLCipher公式推奨のマイグレーション手法
 - 全テーブル・インデックスを一括変換
-- `ATTACH DATABASE ... KEY ...` → `sqlcipher_export` → `DETACH` の3ステップで完了
+- SQL インジェクション対策のため、`ATTACH DATABASE '{path}' AS encrypted;`（KEY 無し）→ `PRAGMA encrypted.key = '{key}';`（`pragma_update` 経由でパラメータ化）→ `sqlcipher_export('encrypted')` → `DETACH DATABASE encrypted;` の 4 ステップで完了
 
 **実装フロー**:
 1. 既存の `clipboard.db` を `clipboard_plain.db` にリネーム
-2. `sqlcipher_export` で `clipboard_plain.db` → 新 `clipboard.db`（暗号化）へ変換
-3. 変換成功後、`clipboard_plain.db` を削除
+2. 呼び出し側 (Swift `AppDelegate`) は `clipboard.db` に前回失敗の残骸がないか確認し、あれば `.migration-backup-<ts>` に rename で退避 (直接削除しない)
+3. `migrate_to_encrypted(plain, encrypted, key)` を呼ぶ:
+   - 両パスは空 / NUL のみ拒否
+   - `encrypted_path` は `format!` に埋め込む際 `'` を `''` にエスケープ
+   - `encryption_key` は `pragma_update` 経由で設定 (SQL 文字列に直接埋め込まない)
+   - `sqlcipher_export` で `clipboard_plain.db` → 新 `clipboard.db`（暗号化）へ変換
+4. 変換成功: `clipboard_plain.db` とバックアップを削除
+5. 変換失敗: バックアップを `clipboard.db` に戻してロールバック、`clipboard_plain.db` は次回起動での再試行のため保持
 
 ---
 

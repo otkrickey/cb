@@ -12,6 +12,6 @@
 4. **ページネーション境界値** — `get_entries_before` で `before_timestamp <= 0` 時に `get_recent_entries` にフォールバックするか。カーソル値の型（`i64`）とSQLite `INTEGER` の整合性
 5. **マイグレーション安全性** — `migrate_to_encrypted` で `sqlcipher_export` によるATTACH/DETACHが正しく行われるか。元DBが破壊されないか。`migrate_add_columns` がべき等（既にカラムが存在する場合はスキップ）に動作するか。`first_copied_at` のバックフィル（`= created_at`）が正しいか
 6. **検索クエリの安全性** — `search_entries` の `query*` 前方一致でFTS5構文インジェクション（`"`, `*`, `NEAR` 等）が発生しないか。空クエリ時のフォールバックが正しいか
-7. **設計書との整合** — `docs/design/modules/cb-core.md` のFFI関数シグネチャ（12関数）・Storageメソッド・スキーマ定義（`copy_count` / `first_copied_at` カラム含む）と実装が一致するか
-8. **テストカバレッジ** — CRUD・暗号化・FTS5・ページネーション・クリーンアップ・touch_entryの各カテゴリに正常系・異常系・境界値テストが存在するか（27テスト）
+7. **設計書との整合** — `docs/design/modules/cb-core.md` のFFI関数シグネチャ（17関数、うち5関数 `save_clipboard_text_v2` / `save_clipboard_blob_ref` / `get_entry_blob_sha256` / `is_blob_missing` / `blob_dir_path` は blob 外部化対応で追加）・Storageメソッド・スキーマ定義（`copy_count` / `first_copied_at` / `text_preview` / `blob_sha256` / `byte_size` カラム含む）と実装が一致するか
+8. **テストカバレッジ** — CRUD・暗号化・FTS5・ページネーション・クリーンアップ・touch_entry・blob 外部化・FTS5 サニタイズ・migrate_to_encrypted インジェクション防御の各カテゴリに正常系・異常系・境界値テストが存在するか（storage.rs 56 + blob_store.rs 7 = 63テスト）
 9. **touch_entryの正確性** — `touch_entry` が `created_at` を現在時刻に更新し `copy_count` をインクリメントするか。`first_copied_at` が変更されず保持されるか。存在しないIDに対して `Ok(false)` を返すか
