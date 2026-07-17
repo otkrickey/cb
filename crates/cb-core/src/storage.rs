@@ -163,9 +163,24 @@ impl Storage {
         Ok(false)
     }
 
-    /// FTS5 を text_preview 索引でリセットする。既存の FTS があれば破棄。
+    /// FTS5 スキーマのバージョン。旧 (text_content 索引) からのマイグレーションが済んで
+    /// text_preview 索引になっていれば FTS_SCHEMA_VERSION と一致する。
+    const FTS_SCHEMA_VERSION: i32 = 2;
+
+    /// FTS5 を text_preview 索引で構築する。
+    ///
+    /// PRAGMA user_version で「text_preview 索引に移行済みか」を判定し、
+    /// 既に移行済みならスキップする。以前は init_schema() のたびに無条件で
+    /// DROP + rebuild していたので、大規模履歴のユーザは毎起動で全件再構築の
+    /// コストを踏んでいた (PR #17 review 指摘)。
     fn rebuild_fts(&self) -> StorageResult<()> {
-        // 既存トリガー/仮想テーブルをまず削除
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version >= Self::FTS_SCHEMA_VERSION {
+            return Ok(());
+        }
+        // 既存トリガー/仮想テーブルをまず削除 (旧スキーマの text_content 索引を廃棄)
         self.conn.execute_batch(
             "DROP TRIGGER IF EXISTS clipboard_entries_ai;
              DROP TRIGGER IF EXISTS clipboard_entries_ad;
@@ -189,8 +204,10 @@ impl Storage {
                  VALUES ('delete', old.id, old.text_preview);
              END;
 
-             INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');"
+             INSERT INTO clipboard_fts(clipboard_fts) VALUES ('rebuild');",
         )?;
+        self.conn
+            .pragma_update(None, "user_version", Self::FTS_SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -1414,6 +1431,36 @@ mod tests {
         let s = Storage::new(encrypted.to_str().unwrap(), Some("abcdefghijklmnop")).unwrap();
         let all = s.get_recent_entries(10).unwrap();
         assert!(all.iter().any(|e| e.text_content.as_deref() == Some("rerun-payload")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rebuild_fts_skipped_after_migration() {
+        // 初回 Storage::new で user_version=2 がセットされ、
+        // 2 回目以降の open では rebuild_fts が早期 return してテーブルが
+        // 破棄・再作成されないことを検証する (PR #17 review Medium 指摘)。
+        let dir = std::env::temp_dir().join("cb_test_rebuild_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+
+        // 1 回目 open
+        {
+            let s = Storage::new(db_path.to_str().unwrap(), None).unwrap();
+            s.insert_text_entry(&ContentType::PlainText, "marker payload", "App").unwrap();
+            // user_version が 2 になっているはず
+            let v: i32 = s.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(v, Storage::FTS_SCHEMA_VERSION);
+        }
+
+        // 2 回目 open — rebuild_fts はスキップされる。FTS テーブルが drop されず
+        // 検索が続けて機能する = 前回 INSERT した内容がまだ引ける。
+        {
+            let s = Storage::new(db_path.to_str().unwrap(), None).unwrap();
+            let results = s.search_entries("marker", 10).unwrap();
+            assert_eq!(results.len(), 1, "rebuild スキップ後も FTS 索引は生き残る");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
